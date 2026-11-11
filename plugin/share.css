@@ -1,0 +1,86 @@
+.relay-form {
+    display: grid;
+    gap: 20px;
+    padding: 4px 0;
+    color: var(--text-normal);
+}
+
+.relay-source {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--text-normal) 4%, transparent);
+}
+
+.relay-source-icon {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    color: var(--text-subtle);
+    background: color-mix(in srgb, var(--text-normal) 5%, transparent);
+}
+
+.relay-source-control {
+    flex: 1;
+    min-width: 0;
+}
+
+.relay-source-control p {
+    margin-top: 8px;
+}
+
+.relay-quality {
+    display: grid;
+    align-content: start;
+    gap: 8px;
+    min-width: 0;
+}
+
+.relay-quality-row,
+.relay-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+    gap: 14px;
+}
+
+.relay-custom {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+    gap: 8px;
+}
+
+.relay-status,
+.relay-error {
+    margin: 0;
+    color: var(--text-subtle, var(--text-normal));
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.relay-error {
+    color: var(--text-feedback-critical, #ff5c5c);
+}
+
+.relay-form .vc-form-switch-container {
+    padding: 0;
+    margin: 0;
+    border: 0;
+}
+
+.relay-options .vc-form-switch-container {
+    padding: 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+}
+
+.relay-auto-share {
+    padding-top: 16px;
+    border-top: 1px solid var(--border-subtle);
+}

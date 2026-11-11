@@ -1,0 +1,13 @@
+diff --git a/src/gst/gstpipewiresrc.c b/src/gst/gstpipewiresrc.c
+--- a/src/gst/gstpipewiresrc.c
++++ b/src/gst/gstpipewiresrc.c
+@@ -1796,5 +1796,8 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
+       if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (*buffer)))
+         GST_BUFFER_DTS (*buffer) += diff;
+     } else {
+-      GST_BUFFER_PTS (*buffer) = GST_BUFFER_DTS (*buffer) = current_clock_time;
++      /* Producers such as niri leave PTS unset. Absolute clock time here
++       * would make GstBaseSrc wait until the machine's uptime has elapsed. */
++      GST_BUFFER_PTS (*buffer) = GST_BUFFER_DTS (*buffer) =
++          gst_element_get_current_running_time (GST_ELEMENT_CAST (pwsrc));
+     }
