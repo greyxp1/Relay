@@ -138,8 +138,9 @@ impl Playback {
     }
 
     fn create_speaker(&self) -> Result<Speaker, String> {
+        // Keep queued loss notifications so the Opus decoder can conceal missing packets.
         let bin = gst::parse::bin_from_description(
-            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=40 drop-on-latency=true do-lost=true ! rtpopusdepay ! opusdec plc=true ! audioconvert", true
+            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=40 do-lost=true ! rtpopusdepay ! opusdec plc=true ! audioconvert", true
         ).map_err(|e| e.to_string())?;
         let input = bin.by_name("input").unwrap().downcast::<AppSrc>().unwrap();
         self.pipeline.add(&bin).map_err(|e| e.to_string())?;
