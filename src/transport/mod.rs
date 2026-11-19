@@ -96,7 +96,6 @@ pub struct Status {
 }
 
 /// Decrypted Opus and its RTP timing, ready for native playback.
-/// The bounded output queue drops frames on overflow, never blocking heartbeats.
 pub struct ReceivedFrame {
     pub marker: bool,
     pub ssrc: u32,
@@ -964,17 +963,19 @@ impl<'a> Call<'a> {
                 let Ok(data) = decryptor.decrypt(Codec::Opus, packet.payload) else {
                     return Ok(());
                 };
-                if let Err(TrySendError::Closed(_)) = output.try_send(ReceivedFrame {
-                    marker: packet.marker,
-                    ssrc: packet.ssrc,
-                    sequence: packet.sequence,
-                    user: user.parse().unwrap_or_default(),
-                    timestamp: packet.timestamp,
-                    data,
-                }) {
-                    return Err("Playback queue closed".into());
-                }
-                Ok(())
+                // Playback is polled alongside transport and can drain a full queue
+                // once this send yields.
+                output
+                    .send(ReceivedFrame {
+                        marker: packet.marker,
+                        ssrc: packet.ssrc,
+                        sequence: packet.sequence,
+                        user: user.parse().unwrap_or_default(),
+                        timestamp: packet.timestamp,
+                        data,
+                    })
+                    .await
+                    .map_err(|_| "Playback queue closed".into())
             }
         }
     }
