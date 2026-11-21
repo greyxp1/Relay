@@ -7,9 +7,10 @@ import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
 import { find, findByCodeLazy } from "@webpack";
 import { ChannelActions, ChannelStore, FluxDispatcher, MediaEngineStore, React, RTCConnectionStore, SelectedChannelStore, showToast, UserStore, VoiceStateStore } from "@webpack/common";
-import { BrowserPlayback } from "./playback";
+import { BrowserPlayback, type StreamOutput } from "./playback";
 import { closeShareDialog, getShareQuality, RelaySettings, saveShareQuality, selectShare } from "./share";
 import workerSource from "file://audio-bridge.js";
+import streamAudioSource from "file://stream-audio.js";
 import videoWorkerSource from "file://video-worker.js";
 
 type RTC = {
@@ -52,6 +53,7 @@ const connections = new Map<RTC, Connection>();
 const stopStream = findByCodeLazy('type:"STREAM_STOP"');
 const startStream = findByCodeLazy('type:"STREAM_START"');
 const screens = new Map<string, Screen>();
+const streamOutputs = new Set<StreamOutput>();
 let playback: BrowserPlayback | undefined;
 let starting: Promise<BrowserPlayback> | undefined;
 let active = false;
@@ -97,6 +99,7 @@ function closePlayback() {
     starting = undefined;
     endCapture();
     current?.close();
+    for (const output of streamOutputs) output.updateAudioElement();
     for (const screen of screens.values()) {
         registry?.remove(screen.id);
         screen.stream.getTracks().forEach(track => track.stop());
@@ -191,6 +194,8 @@ async function ensurePlayback() {
         }, {
             url: "ws://127.0.0.1:38446/media",
             worker: blob(workerSource),
+            streamAudio: () => blob(streamAudioSource),
+            audioError: error => toast(`Relay: Could not isolate received stream audio. ${error}`),
             control: message => { if (playback === current) control(message); },
             frame: (owner, stream) => { if (playback === current) screenStream(owner, stream); },
         });
@@ -203,6 +208,7 @@ async function ensurePlayback() {
             throw new Error("Could not connect to the companion. Check that Relay is running.");
         }
         if (playback !== current) return current;
+        for (const output of streamOutputs) output.updateAudioElement();
         speakingTimer = setInterval(() => {
             if (captureTrack?.readyState === "ended") {
                 send({ op: "cancelShare" });
@@ -251,6 +257,7 @@ async function nativeCapture(options?: DisplayMediaStreamOptions): Promise<Media
     const interactive = !automaticCapture;
     const { autoShare, ...quality } = interactive ? await selectShare(initial, !!changing) : initial;
     const current = await ensurePlayback();
+    if (quality.audio) current.requireStreamIsolation();
     const id = crypto.randomUUID();
     await new Promise<void>((resolve, reject) => {
         preparing = { id, resolve, reject };
@@ -312,6 +319,25 @@ const plugin = definePlugin({
             { match: /destroy\(\)\{(?=if\(this\.logger\.info\("Destroy RTCConnection"\))/, replace: "destroy(){$self.disconnect(this);" },
             { match: /reconnect=\(\)=>\{/, replace: "reconnect=()=>{if($self.owns(this))return $self.connect(this,this.endpoint?.replace(/^wss?:\\/\\//,'').replace(/\\/$/,''),this.token);" },
         ],
+    }, {
+        find: "BaseWebRTCConnection.createOutput: ignoring track being torn down",
+        group: true,
+        replacement: [{
+            match: /(\),)(\i)\.addTrack\((\i)\)(?=\}destroyOutput\()/,
+            replace: '$1this.context==="stream"?$self.addStreamTrack($2,$3):$2.addTrack($3)',
+        }, {
+            match: /(updateAudioElement\(\)\{)(?=let \i=this\.audioElement)/,
+            replace: "$1if($self.routeStreamOutput(this))return;",
+        }, {
+            match: /(\i\.srcObject=this\.stream),this\.playAudio\((\i)\),(this\.audioElement=\i,this\.updateAudioElement\(\))/,
+            replace: "$1,$3,this.playAudio($2)",
+        }, {
+            match: /(\bremoveTrack\(\i\)\{return this\.stream\.removeTrack\(\i\),)/,
+            replace: "$1$self.routeStreamOutput(this),",
+        }, {
+            match: /(\bdestroy\(\)\{)(?=this\.audioElement\?\.pause\(\))/,
+            replace: "$1$self.removeStreamOutput(this);",
+        }],
     }, {
         // Discord answers H.264 with constrained baseline, even when Chromium offers baseline first.
         find: ";level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
@@ -438,6 +464,17 @@ const plugin = definePlugin({
         return new Worker(blob(`const relayWorkerURL=${JSON.stringify(url.href)};\n${videoWorkerSource}`), options);
     },
     usesNativeVoice() { return active && !!registry; },
+    addStreamTrack(output: StreamOutput, track: MediaStreamTrack) {
+        if (active) streamOutputs.add(output);
+        output.addTrack(track);
+        if (active) output.updateAudioElement();
+    },
+    routeStreamOutput(output: StreamOutput) {
+        return streamOutputs.has(output) && playback?.routeStreamAudio(output);
+    },
+    removeStreamOutput(output: StreamOutput) {
+        if (streamOutputs.delete(output)) playback?.removeStreamAudio(output);
+    },
     voiceStatus(label: React.ReactNode, channel = SelectedChannelStore.getVoiceChannelId()) {
         const connection = connections.get(RTCConnectionStore.getRTCConnection());
         return connection?.ready && connection.rtc.channelId === channel ? "Relay Connected" : label;
@@ -526,6 +563,7 @@ const plugin = definePlugin({
         for (const connection of connections.values()) connection.rtc.setState("RTC_DISCONNECTED");
         connections.clear();
         closePlayback();
+        streamOutputs.clear();
     },
 });
 

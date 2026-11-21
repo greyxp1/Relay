@@ -96,6 +96,7 @@ static void global(void *data, uint32_t id, uint32_t permissions,
             connect_target(s, t);
     } else if (spa_streq(media, "Stream/Output/Audio") && serial &&
                !spa_streq(name, "relay-playback") &&
+               !spa_streq(name, "relay-stream-playback") &&
                !(name && spa_strstartswith(name, "relay-share-"))) {
         struct target *t = calloc(1, sizeof(*t));
         if (!t) {

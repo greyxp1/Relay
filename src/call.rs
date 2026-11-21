@@ -2,7 +2,7 @@ use crate::WebSocket;
 use crate::{
     capture::{Capture, ClockTime, Codec, Frame, ScreenSettings, VideoSettings},
     dave::Identity,
-    playback::Playback,
+    playback::{Playback, STREAM_AUDIO_BYTES},
     transport::{self, Credentials, Mode},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +14,7 @@ use tokio::{
     task::JoinHandle,
     time::{self, Instant},
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Deserialize)]
@@ -198,6 +198,7 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
     let mut identity: Option<(String, Zeroizing<String>, Identity)> = None;
     let mut prepared: Option<Prepared> = None;
     let mut picker: Option<Picker> = None;
+    let mut stream_audio = None;
     let result = async {
         send(&mut sending, Message::Text("{}".into())).await?;
         let mut tick = time::interval(Duration::from_millis(250));
@@ -232,9 +233,13 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                                 let (voice, settings) = watch::channel(voice);
                                 let (keyframe, _) = watch::channel(());
                                 let (replacement, replacements) = mpsc::channel(1);
+                                let (audio, stream_samples) = mpsc::channel(3);
+                                if !streaming {
+                                    stream_audio = Some(audio);
+                                }
                                 let (output, finished, call_id, keyframes) = (output.clone(), finished.clone(), id.clone(), keyframe.clone());
                                 let task = tokio::task::spawn_local(async move {
-                                    let controls = Controls { voice: settings, keyframe: keyframes, capture: replacements };
+                                    let controls = Controls { voice: settings, keyframe: keyframes, capture: replacements, stream_samples };
                                     let (result, recovered) = run(credentials, capture, controls, &call_id, &output).await;
                                     let error = result.err();
                                     if let Some(error) = &error {
@@ -265,6 +270,11 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                                 if let Some((_, _, task)) = picker.take() { task.abort(); }
                                 prepared = None;
                             }
+                        }
+                    }
+                    Some(Ok(Message::Binary(samples))) if samples.len() == STREAM_AUDIO_BYTES => {
+                        if let Some(audio) = stream_audio.as_ref() {
+                            let _ = audio.try_send(samples);
                         }
                     }
                     Some(Ok(Message::Ping(bytes))) => send(&mut sending, Message::Pong(bytes)).await?,
@@ -326,6 +336,7 @@ struct Controls {
     voice: watch::Receiver<Voice>,
     keyframe: watch::Sender<()>,
     capture: mpsc::Receiver<CaptureChange>,
+    stream_samples: mpsc::Receiver<Bytes>,
 }
 
 /// Runs media sessions until one ends, adopting replacement captures and
@@ -348,6 +359,7 @@ async fn run(
                 &mut prepared,
                 voice,
                 &controls.keyframe,
+                &mut controls.stream_samples,
                 output,
             );
             tokio::select! {
@@ -399,6 +411,7 @@ async fn run_session(
     prepared: &mut Option<Prepared>,
     mut settings: watch::Receiver<Voice>,
     keyframe: &watch::Sender<()>,
+    stream_samples: &mut mpsc::Receiver<Bytes>,
     output: &mpsc::Sender<Message>,
 ) -> Result<(), String> {
     let (status_tx, mut status_rx) = watch::channel(transport::Status::default());
@@ -565,6 +578,11 @@ async fn run_session(
             frame = frames.recv(), if !streaming => {
                 playback.as_mut().unwrap().push(frame.ok_or("Media receiver closed")?)?;
             }
+            Some(samples) = stream_samples.recv(), if !streaming => {
+                if let Err(error) = playback.as_mut().unwrap().push_stream(samples).await {
+                    device_error(output, format!("Could not play received stream audio. {error}"));
+                }
+            }
             Ok(()) = codec_rx.changed(), if streaming => {
                 pending_frame = None;
                 let codec = *codec_rx.borrow_and_update();
@@ -586,6 +604,9 @@ async fn run_session(
                 }
                 if let Some(native) = playback.as_mut() {
                     if let Some(error) = native.error() { return Err(error); }
+                    if let Some(error) = native.stream_error() {
+                        device_error(output, format!("Could not play received stream audio. {error}"));
+                    }
                     let mut speakers = native.speakers();
                     if capture.peak.swap(0, Ordering::Relaxed) > 512 { heard = Some(Instant::now()); }
                     if *voice_tx.borrow() && heard.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {

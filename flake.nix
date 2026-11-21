@@ -70,11 +70,11 @@
       cp ${./plugin/index.ts} $out/index.ts
       cp ${./plugin/share.tsx} $out/share.tsx
       cp ${./plugin/share.css} $out/share.css
-      cp ${./plugin}/playback.ts ${./plugin}/audio-bridge.ts ${./plugin}/video-worker.ts .
+      cp ${./plugin}/{playback,audio-bridge,stream-audio,video-worker}.ts .
       tsc --declaration --strict false --skipLibCheck --target ES2024 --module ESNext --lib ES2024,DOM,DOM.Iterable \
         --outDir $out playback.ts
       tsc --target ES2024 --module ESNext --lib ES2024,DOM,DOM.Iterable \
-        --outDir $out audio-bridge.ts video-worker.ts
+        --outDir $out audio-bridge.ts stream-audio.ts video-worker.ts
     '';
   in {
     packages.${system} = {default = companion; inherit companion plugin;};

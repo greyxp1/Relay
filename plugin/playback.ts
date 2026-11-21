@@ -85,8 +85,24 @@ interface PlaybackScreen {
 interface PlaybackConnection {
   url: string
   worker: string
+  streamAudio: () => string
+  audioError: (error: unknown) => void
   control: (message: any) => void
   frame: (owner: string, stream: MediaStream) => void
+}
+export interface StreamOutput {
+  audioElement: HTMLAudioElement | null
+  stream: MediaStream
+  _mute: boolean
+  _volume: number
+  addTrack(track: MediaStreamTrack): number
+  updateAudioElement(): void
+}
+interface StreamInput {
+  track: MediaStreamTrack
+  source: MediaStreamAudioSourceNode
+  gain: GainNode
+  ready: boolean
 }
 declare const MediaStreamTrackGenerator: {
   new (options: { kind: 'video' }): MediaStreamTrack & { writable: WritableStream<VideoFrame> }
@@ -99,6 +115,10 @@ export class BrowserPlayback {
   socket: Worker
   ready: Promise<void>
   disconnected?: () => void
+  private audio?: { context: AudioContext; mixer: Promise<AudioWorkletNode> }
+  private streamInputs = new Map<StreamOutput, StreamInput>()
+  private streamAudioFailure?: Error
+  private streamIsolationRequired = false
   constructor(public report: (message: string, owner?: string, recover?: boolean) => void, public connection: PlaybackConnection) {}
   async start() {
     if (this.closed) return
@@ -125,6 +145,85 @@ export class BrowserPlayback {
     })
     socket.postMessage({ url: this.connection.url })
     await this.ready
+  }
+  routeStreamAudio(output: StreamOutput) {
+    const element = output.audioElement
+    if (this.closed || !element) return false
+    const track = output.stream.getAudioTracks()[0]
+    let input = this.streamInputs.get(output)
+    if (input?.track !== track) {
+      this.removeStreamAudio(output)
+      input = undefined
+      if (track && !this.streamAudioFailure) {
+        try {
+          const { context, mixer } = this.audio ??= this.startStreamAudio()
+          const source = context.createMediaStreamSource(new MediaStream([track]))
+          const gain = context.createGain()
+          const next = { track, source, gain, ready: false }
+          gain.gain.value = 0
+          this.streamInputs.set(output, next)
+          source.connect(gain)
+          Promise.all([mixer, context.resume()]).then(([node]) => {
+            if (this.streamInputs.get(output) !== next) return
+            gain.connect(node)
+            next.ready = true
+            output.updateAudioElement()
+          }).catch(error => {
+            if (this.streamInputs.get(output) === next) this.failStreamAudio(error)
+          })
+          input = next
+        } catch (error) {
+          this.failStreamAudio(error)
+        }
+      }
+    }
+    if (!input?.ready && !this.streamIsolationRequired) return false
+    element.muted = true
+    if (input?.ready) input.gain.gain.value = output._mute ? 0 : output._volume / 100
+    return true
+  }
+  requireStreamIsolation() {
+    if (this.streamAudioFailure) throw this.streamAudioFailure
+    // Keep the browser output off until the media connection closes, including while a share stops.
+    this.streamIsolationRequired = true
+    for (const output of this.streamInputs.keys()) output.updateAudioElement()
+  }
+  private failStreamAudio(error: unknown) {
+    if (this.closed || this.streamAudioFailure) return
+    this.streamAudioFailure = new Error('Could not isolate received stream audio', { cause: error })
+    for (const output of this.streamInputs.keys()) {
+      this.removeStreamAudio(output)
+      output.updateAudioElement()
+    }
+    void this.audio?.context.close().catch(() => {})
+    this.audio = undefined
+    this.connection.audioError(error)
+  }
+  private startStreamAudio() {
+    // The worklet passes Discord's mix to the companion without opening a browser output.
+    const options = { sampleRate: 48000, sinkId: { type: 'none' } }
+    const context = new AudioContext(options)
+    const mixer = Promise.resolve().then(() => context.audioWorklet.addModule(this.connection.streamAudio())).then(() => {
+      if (this.closed) throw new Error('The local media connection closed.')
+      const node = new AudioWorkletNode(context, 'relay-stream-audio', {
+        numberOfOutputs: 0, channelCountMode: 'explicit',
+      })
+      node.onprocessorerror = () => this.failStreamAudio(new Error('The stream audio processor stopped.'))
+      const { port1, port2 } = new MessageChannel()
+      this.socket.postMessage(port1, [port1])
+      node.port.postMessage(port2, [port2])
+      return node
+    })
+    void mixer.catch(error => this.failStreamAudio(error))
+    return { context, mixer }
+  }
+  removeStreamAudio(output: StreamOutput) {
+    const input = this.streamInputs.get(output)
+    if (!input) return
+    this.streamInputs.delete(output)
+    input.source.disconnect()
+    input.gain.disconnect()
+    if (!this.closed && !this.streamInputs.size) void this.audio?.context.suspend().catch(() => {})
   }
   packet(bytes: Uint8Array) {
     if (this.closed) return
@@ -245,6 +344,8 @@ export class BrowserPlayback {
   close() {
     if (this.closed) return
     this.closed = true
+    for (const output of this.streamInputs.keys()) this.removeStreamAudio(output)
+    void this.audio?.context.close().catch(() => {})
     this.socket?.terminate()
     this.disconnected?.()
     this.reset()

@@ -5,6 +5,11 @@ use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
+use tokio::task::{spawn_blocking, JoinHandle};
+use tokio_tungstenite::tungstenite::Bytes;
+
+const STREAM_FRAMES: u64 = 512;
+pub const STREAM_AUDIO_BYTES: usize = STREAM_FRAMES as usize * 2 * size_of::<f32>();
 
 struct Speaker {
     bin: gst::Bin,
@@ -15,6 +20,55 @@ struct Speaker {
     voiced: Option<Instant>,
 }
 
+#[derive(Default)]
+enum StreamPlayback {
+    #[default]
+    Idle,
+    Starting(JoinHandle<Result<StreamOutput, String>>),
+    Playing(StreamOutput),
+    Failed,
+}
+
+struct StreamOutput {
+    pipeline: gst::Pipeline,
+    input: AppSrc,
+}
+
+impl StreamOutput {
+    fn new(device: Option<&str>) -> Result<Self, String> {
+        let pipeline = gst::parse::launch(
+            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=3 leaky-type=downstream caps=\"audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2\" ! pulsesink name=output async=false sync=false buffer-time=50000 latency-time=10000 stream-properties=props,node.name=relay-stream-playback,application.name=Relay",
+        )
+        .map_err(|e| e.to_string())?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "Invalid stream audio pipeline")?;
+        let stream = Self {
+            input: pipeline
+                .by_name("input")
+                .unwrap()
+                .downcast::<AppSrc>()
+                .unwrap(),
+            pipeline,
+        };
+        stream
+            .pipeline
+            .by_name("output")
+            .unwrap()
+            .set_property("device", device);
+        stream
+            .pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| e.to_string())?;
+        Ok(stream)
+    }
+}
+
+impl Drop for StreamOutput {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
 /// RTP timing, concealment and mixing run on GStreamer's streaming threads.
 pub struct Playback {
     pipeline: gst::Pipeline,
@@ -22,6 +76,7 @@ pub struct Playback {
     speakers: HashMap<u64, Speaker>,
     volumes: HashMap<u64, f64>,
     first: Option<Speaker>,
+    stream: StreamPlayback,
 }
 
 impl Playback {
@@ -41,6 +96,7 @@ impl Playback {
             speakers: HashMap::new(),
             volumes: HashMap::new(),
             first: None,
+            stream: StreamPlayback::default(),
         };
         // Load and link the first decoder before RTP starts arriving.
         playback.first = Some(playback.create_speaker()?);
@@ -48,7 +104,7 @@ impl Playback {
         Ok(playback)
     }
 
-    pub fn set_device(&self, selected: &str) -> Result<(), String> {
+    pub fn set_device(&mut self, selected: &str) -> Result<(), String> {
         let device = (!selected.is_empty())
             .then(|| Capture::audio_device(selected, true))
             .transpose()?;
@@ -69,6 +125,7 @@ impl Playback {
             })?;
             return Err(error);
         }
+        self.stream = StreamPlayback::Idle;
         Ok(())
     }
 
@@ -145,6 +202,54 @@ impl Playback {
             .map_err(|e| e.to_string())
     }
 
+    pub async fn push_stream(&mut self, samples: Bytes) -> Result<(), String> {
+        match &mut self.stream {
+            StreamPlayback::Idle => {
+                let device = self
+                    .pipeline
+                    .by_name("output")
+                    .unwrap()
+                    .property::<Option<String>>("device");
+                self.stream = StreamPlayback::Starting(spawn_blocking(move || {
+                    StreamOutput::new(device.as_deref())
+                }));
+            }
+            StreamPlayback::Starting(start) if start.is_finished() => {
+                let result = start
+                    .await
+                    .map_err(|_| "Stream audio setup stopped".to_owned())
+                    .and_then(|result| result);
+                self.stream = StreamPlayback::Failed;
+                self.stream = StreamPlayback::Playing(result?);
+            }
+            _ => {}
+        }
+        let StreamPlayback::Playing(stream) = &self.stream else {
+            return Ok(());
+        };
+        let mut buffer = gst::Buffer::from_slice(samples);
+        buffer
+            .get_mut()
+            .unwrap()
+            .set_duration(gst::ClockTime::from_nseconds(
+                STREAM_FRAMES * 1_000_000_000 / 48_000,
+            ));
+        if let Err(error) = stream.input.push_buffer(buffer) {
+            self.stream = StreamPlayback::Failed;
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    pub fn stream_error(&mut self) -> Option<String> {
+        let StreamPlayback::Playing(stream) = &self.stream else {
+            return None;
+        };
+        let error = pipeline_error(&stream.pipeline)?;
+        self.stream = StreamPlayback::Failed;
+        Some(error)
+    }
+
     fn create_speaker(&self) -> Result<Speaker, String> {
         // Keep queued loss notifications so the Opus decoder can conceal missing packets.
         let bin = gst::parse::bin_from_description(
@@ -191,22 +296,25 @@ impl Playback {
     }
 
     pub fn error(&self) -> Option<String> {
-        for message in self
-            .pipeline
-            .bus()?
-            .iter_filtered(&[gst::MessageType::Error, gst::MessageType::Latency])
-        {
-            match message.view() {
-                gst::MessageView::Error(error) => return Some(error.error().to_string()),
-                _ => {
-                    if let Err(error) = self.pipeline.recalculate_latency() {
-                        return Some(error.to_string());
-                    }
+        pipeline_error(&self.pipeline)
+    }
+}
+
+fn pipeline_error(pipeline: &gst::Pipeline) -> Option<String> {
+    for message in pipeline
+        .bus()?
+        .iter_filtered(&[gst::MessageType::Error, gst::MessageType::Latency])
+    {
+        match message.view() {
+            gst::MessageView::Error(error) => return Some(error.error().to_string()),
+            _ => {
+                if let Err(error) = pipeline.recalculate_latency() {
+                    return Some(error.to_string());
                 }
             }
         }
-        None
     }
+    None
 }
 
 impl Drop for Playback {

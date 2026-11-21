@@ -2,7 +2,15 @@
 const bridge = globalThis as unknown as Worker
 let socket: WebSocket
 bridge.onmessage = ({ data }) => {
-  if (!data.url) {
+  if (data instanceof MessagePort) {
+    data.onmessage = ({ data: samples }: MessageEvent<ArrayBuffer>) => {
+      if (socket?.readyState === WebSocket.OPEN && socket.bufferedAmount < samples.byteLength * 3) {
+        socket.send(samples)
+      }
+    }
+    return
+  }
+  if (typeof data === 'string') {
     if (socket?.readyState === WebSocket.OPEN) socket.send(data)
     return
   }
