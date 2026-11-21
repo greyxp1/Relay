@@ -158,7 +158,7 @@ impl Playback {
     fn create_speaker(&self) -> Result<Speaker, String> {
         // Keep queued loss notifications so the Opus decoder can conceal missing packets.
         let bin = gst::parse::bin_from_description(
-            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=60 do-lost=true max-dropout-time=1000 max-misorder-time=500 ! rtpopusdepay ! opusdec plc=true use-inband-fec=true ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,rate=48000,channels=2", true
+            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=60 do-lost=true max-dropout-time=1000 max-misorder-time=500 ! rtpopusdepay ! opusdec plc=true use-inband-fec=true ! audioconvert ! audioresample ! capsfilter caps=\"audio/x-raw,format=F32LE,rate=48000,channels=2\"", true
         ).map_err(|e| e.to_string())?;
         let input = bin.by_name("input").unwrap().downcast::<AppSrc>().unwrap();
         self.pipeline.add(&bin).map_err(|e| e.to_string())?;
@@ -220,5 +220,18 @@ impl Playback {
 impl Drop for Playback {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_bin_parses() {
+        gst::init().unwrap();
+        let playback = Playback::new("").unwrap();
+        let speaker = playback.create_speaker().unwrap();
+        playback.remove_speaker(speaker);
     }
 }
