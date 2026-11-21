@@ -60,9 +60,7 @@ static void connect_target(struct share_audio *s, struct target *t)
              " node.passive=true node.dont-fallback=true node.linger=true } }",
              t->serial, s->name, t->serial, s->name, s->name, t->serial);
     t->module = pw_context_load_module(s->context, "libpipewire-module-loopback", args, NULL);
-    if (!t->module)
-        s->error = errno;
-    else
+    if (t->module)
         pw_impl_module_add_listener(t->module, &t->listener, &events, t);
 }
 
@@ -108,7 +106,6 @@ static void global(void *data, uint32_t id, uint32_t permissions,
             t->owner = s;
             t->node = pw_registry_bind(s->registry, id, type, SPA_MIN(version, (uint32_t)PW_VERSION_NODE), 0);
             if (!t->node) {
-                s->error = errno;
                 free(t);
             } else {
                 spa_list_append(&s->targets, &t->link);

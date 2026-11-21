@@ -407,3 +407,8 @@ pub(super) fn sender_report(
     report.extend([0, 0, 0]);
     Ok(report)
 }
+
+pub(super) fn receiver_report(ssrc: u32) -> [u8; 8] {
+    let [a, b, c, d] = ssrc.to_be_bytes();
+    [0x80, 201, 0, 1, a, b, c, d]
+}

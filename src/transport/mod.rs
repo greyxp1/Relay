@@ -793,8 +793,13 @@ impl<'a> Call<'a> {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-            for report in reports {
-                self.send_sealed(&report[..8], &[&report[8..]]).await?;
+            if reports.is_empty() && self.cipher.is_some() {
+                let keepalive = rtp::receiver_report(self.ssrc);
+                self.send_sealed(&keepalive, &[]).await?;
+            } else {
+                for report in reports {
+                    self.send_sealed(&report[..8], &[&report[8..]]).await?;
+                }
             }
             self.next_report = now + Duration::from_secs(5);
         }
@@ -855,13 +860,11 @@ impl<'a> Call<'a> {
         } else {
             &mut self.audio_sender
         };
-        let pts = frame.pts.nseconds();
-        if let Some(previous) = sender.last_pts.filter(|previous| pts <= *previous) {
-            return Err(format!(
-                "Nonmonotonic media timestamp ({:?}: {previous} -> {pts} ns)",
-                frame.codec
-            ));
-        }
+        let step = if video { 1_000_000 } else { 20_000_000 };
+        let pts = match sender.last_pts {
+            Some(previous) if frame.pts.nseconds() <= previous => previous.saturating_add(step),
+            _ => frame.pts.nseconds(),
+        };
         sender.last_pts = Some(pts);
         let timestamp = sender.origin.wrapping_add(
             (u128::from(pts) * u128::from(frame.codec.clock()) / 1_000_000_000) as u32,
@@ -1456,6 +1459,9 @@ impl<'a> Call<'a> {
             self.startup = Instant::now() + self.negotiation_timeout;
         }
         let transport = self.cipher.is_some() && self.discovered && self.heartbeat.is_some();
+        if ready && transport {
+            self.recoveries = 0;
+        }
         if ready && transport && !(self.dave_ready && self.status.transport_ready) {
             let speaking = match &mut self.mode {
                 Mode::Voice { speaking, .. } => Some(u8::from(*speaking.borrow_and_update())),

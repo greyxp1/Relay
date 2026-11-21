@@ -78,6 +78,11 @@ enum Command {
     Stop {
         id: String,
     },
+    Reconnect {
+        id: String,
+        endpoint: String,
+        token: Zeroizing<String>,
+    },
     Voice {
         id: String,
         #[serde(flatten)]
@@ -127,6 +132,10 @@ enum CaptureChange {
         quality: ScreenSettings,
         audio: bool,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    Reconnect {
+        endpoint: String,
+        token: Zeroizing<String>,
     },
 }
 
@@ -202,7 +211,8 @@ async fn send(
 pub async fn serve(socket: WebSocket) -> Result<(), String> {
     let (mut sending, mut incoming) = socket.split();
     let (output, mut outgoing) = mpsc::channel(64);
-    let (finished, mut completions) = mpsc::channel::<String>(16);
+    let (finished, mut completions) =
+        mpsc::channel::<(String, Option<Prepared>, Option<String>)>(16);
     let mut calls = HashMap::<String, Call>::new();
     let mut identity: Option<(String, Zeroizing<String>, Identity)> = None;
     let mut prepared = None;
@@ -256,13 +266,21 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                                 let recovery = keyframe.clone();
                                 let (replacement, replacements) = mpsc::channel(1);
                                 let task = tokio::task::spawn_local(async move {
-                                    let result = run(&call_id, credentials, capture, Controls { voice: settings, keyframe: recovery, capture: replacements }, &output).await;
-                                    let _ = output.send(Message::Text(json!({"op":"ended", "id":call_id, "error":result.err()}).to_string().into())).await;
-                                    let _ = finished.send(call_id).await;
+                                    let (result, recovered) = run(&call_id, credentials, capture, Controls { voice: settings, keyframe: recovery, capture: replacements }, &output).await;
+                                    let error = result.err();
+                                    if let Some(error) = &error {
+                                        eprintln!("Call {call_id} ended: {error}");
+                                    }
+                                    let _ = finished.send((call_id, recovered, error)).await;
                                 });
                                 calls.insert(id, Call { task, voice: voice_control, keyframe, capture: streaming.then_some(replacement), source });
                             }
                             Command::Stop { id } => { calls.remove(&id); }
+                            Command::Reconnect { id, endpoint, token } => {
+                                if let Some(capture) = calls.get(&id).and_then(|call| call.capture.as_ref()) {
+                                    let _ = capture.try_send(CaptureChange::Reconnect { endpoint, token });
+                                }
+                            }
                             Command::Voice { id, voice } => {
                                 if let Some(call) = calls.get(&id) { call.voice.send_replace(voice); }
                             }
@@ -303,7 +321,21 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                 Some(message) = outgoing.recv() => {
                     send(&mut sending, message).await?;
                 }
-                Some(id) = completions.recv() => { calls.remove(&id); }
+                Some((id, recovered, error)) = completions.recv() => {
+                    calls.remove(&id);
+                    let recoverable = if let Some(mut recovered) = recovered {
+                        if prepared.is_none() {
+                            recovered.expires = Instant::now() + Duration::from_secs(60);
+                            prepared = Some(recovered);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    send(&mut sending, Message::Text(json!({"op":"ended", "id":id, "error":error, "recoverable":recoverable}).to_string().into())).await?;
+                }
                 result = preparing(&mut picker) => {
                     let (id, replace, _) = picker.take().unwrap();
                     let error = match result {
@@ -348,39 +380,55 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
 
 async fn run(
     id: &str,
-    credentials: Credentials,
+    mut credentials: Credentials,
     mut prepared: Option<Prepared>,
     mut controls: Controls,
     output: &mpsc::Sender<Message>,
-) -> Result<(), String> {
+) -> (Result<(), String>, Option<Prepared>) {
     let streaming = prepared.is_some();
     loop {
-        let next = {
+        let outcome = {
             let session = run_session(
                 id,
                 credentials.clone(),
-                prepared.take(),
+                &mut prepared,
                 controls.voice.clone(),
                 controls.keyframe.clone(),
                 output,
             );
             tokio::pin!(session);
             tokio::select! {
-                result = &mut session => return result,
-                replacement = controls.capture.recv(), if streaming => replacement.ok_or("Stream controls closed")?,
+                result = &mut session => Ok(result),
+                replacement = controls.capture.recv(), if streaming => Err(replacement),
             }
         };
+        let next = match outcome {
+            Ok(result) => {
+                let recoverable = result.is_err()
+                    && prepared.as_ref().is_some_and(|p| p.capture.error().is_none())
+                    && !matches!(
+                        result.as_ref().map_err(String::as_str),
+                        Err("Capture ended" | "Browser connection closed")
+                    );
+                return (result, if recoverable { prepared } else { None });
+            }
+            Err(Some(change)) => change,
+            Err(None) => return (Err("Stream controls closed".into()), None),
+        };
+        if let CaptureChange::Reconnect { endpoint, token } = next {
+            credentials.endpoint = endpoint;
+            credentials.token = token;
+            continue;
+        }
         // The Discord stream stays open while its media session adopts the new source and quality.
-        output
-            .try_reserve()
-            .map_err(|_| "Browser playback stalled")?
-            .send(packet(
-                4,
-                0,
-                credentials.user_id.parse().map_err(|_| "Invalid user")?,
-                0,
-                &[],
-            ));
+        let user = match credentials.user_id.parse() {
+            Ok(user) => user,
+            Err(_) => return (Err("Invalid user".into()), None),
+        };
+        let Ok(permit) = output.try_reserve() else {
+            return (Err("Browser playback stalled".into()), None);
+        };
+        permit.send(packet(4, 0, user, 0, &[]));
         prepared = Some(match next {
             CaptureChange::Prepared(prepared) => prepared,
             CaptureChange::Camera {
@@ -390,6 +438,7 @@ async fn run(
                 reply,
             } => {
                 // Cameras can be exclusive. The old session must release its device before reopening it.
+                drop(prepared.take());
                 match prepare(quality, audio, Some(source)).await {
                     Ok(prepared) => {
                         let _ = reply.send(Ok(()));
@@ -397,10 +446,11 @@ async fn run(
                     }
                     Err(error) => {
                         let _ = reply.send(Err(error.clone()));
-                        return Err(error);
+                        return (Err(error), None);
                     }
                 }
             }
+            CaptureChange::Reconnect { .. } => unreachable!(),
         });
     }
 }
@@ -408,7 +458,7 @@ async fn run(
 async fn run_session(
     id: &str,
     credentials: Credentials,
-    prepared: Option<Prepared>,
+    prepared: &mut Option<Prepared>,
     mut settings: watch::Receiver<Voice>,
     requests: watch::Sender<()>,
     output: &mpsc::Sender<Message>,
@@ -420,18 +470,16 @@ async fn run_session(
     let (received, mut frames) = mpsc::channel(16);
     let (video, mut pictures) = mpsc::channel(4);
     let mut current = settings.borrow_and_update().clone();
-    let mut capture;
+    let mut voice_capture = None;
     let mut audio_capture = None;
     let mut playback = None;
-    let mut capture_frames;
-    let (codec_tx, mut codec_rx) = watch::channel(Codec::H264);
+    let initial_codec = prepared.as_ref().map_or(Codec::H264, |p| p.video.codec);
+    let (codec_tx, mut codec_rx) = watch::channel(initial_codec);
     let (keyframe_tx, mut keyframe_rx) = mpsc::channel(1);
     let (voice_tx, voice_rx) = watch::channel(!current.mute && !current.deaf);
     let (send, input) = mpsc::channel(4);
     let user: u64 = credentials.user_id.parse().map_err(|_| "Invalid user")?;
-    let mode = if let Some(p) = prepared {
-        capture = p.capture;
-        capture_frames = p.frames;
+    let mode = if let Some(p) = prepared.as_ref() {
         let audio_input = if p.audio {
             let (audio, input) = Capture::share_audio().await?;
             audio_capture = Some(audio);
@@ -441,7 +489,7 @@ async fn run_session(
         };
         Mode::GoLive {
             settings: p.video,
-            codecs: p.codecs,
+            codecs: p.codecs.clone(),
             codec: codec_tx,
             video: input,
             audio: audio_input,
@@ -472,8 +520,7 @@ async fn run_session(
             &current.users,
         );
         playback = Some(native);
-        capture = mic;
-        capture_frames = receiver;
+        voice_capture = Some((mic, receiver));
         Mode::Voice {
             video,
             keyframes: requests.subscribe(),
@@ -496,6 +543,12 @@ async fn run_session(
     let mut heard = None;
     let mut tick = time::interval(Duration::from_millis(100));
     loop {
+        let (capture, capture_frames) = if let Some(p) = prepared.as_mut() {
+            (&mut p.capture, &mut p.frames)
+        } else {
+            let (mic, receiver) = voice_capture.as_mut().unwrap();
+            (mic, receiver)
+        };
         tokio::select! {
             biased;
             result = &mut transport => return result,
@@ -522,7 +575,8 @@ async fn run_session(
                     match replacement {
                         Ok((replacement, receiver)) => {
                             offset = ClockTime::from_nseconds(started.elapsed().as_nanos() as u64).max(last_pts + ClockTime::from_mseconds(20));
-                            capture = replacement; capture_frames = receiver;
+                            *capture = replacement;
+                            *capture_frames = receiver;
                         }
                         Err(error) => {
                             let _ = output.try_send(Message::Text(json!({"op":"deviceError", "error":format!("{error}. Previous microphone remains active.")}).to_string().into()));
@@ -557,7 +611,7 @@ async fn run_session(
                 if streaming {
                     if !preview_waiting || frame.keyframe {
                         preview_waiting = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame))).is_err();
-                        if preview_waiting { capture.request_keyframe()?; }
+                        if preview_waiting { let _ = capture.request_keyframe(); }
                     }
                 } else {
                     if !*voice_tx.borrow() { continue; }
@@ -586,15 +640,19 @@ async fn run_session(
             }
             Ok(()) = codec_rx.changed(), if streaming => {
                 pending_frame = None;
-                capture.set_codec(*codec_rx.borrow_and_update())?;
+                let codec = *codec_rx.borrow_and_update();
+                capture.set_codec(codec)?;
+                if let Some(p) = prepared.as_mut() {
+                    p.video.codec = codec;
+                }
                 preview_waiting = true;
                 let _ = output.try_reserve().map(|permit| permit.send(packet(4, 0, user, 0, &[])));
             }
             Ok(()) = recovery_requests.changed(), if streaming => {
                 preview_waiting = true;
-                capture.request_keyframe()?;
+                let _ = capture.request_keyframe();
             }
-            Some(()) = keyframe_rx.recv(), if streaming => { capture.request_keyframe()?; }
+            Some(()) = keyframe_rx.recv(), if streaming => { let _ = capture.request_keyframe(); }
             _ = tick.tick() => {
                 if let Some(error) = capture.error().or_else(|| audio_capture.as_ref().and_then(Capture::error)) { return Err(error); }
                 if !streaming {

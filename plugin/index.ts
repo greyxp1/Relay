@@ -41,7 +41,7 @@ type RTC = {
     _handlePing(ping: number): void;
 };
 
-type Connection = { id: string; rtc: RTC; owner?: string; source?: string; ready: boolean; started: boolean };
+type Connection = { id: string; rtc: RTC; owner?: string; source?: string; ready: boolean; started: boolean; ended?: boolean };
 type Screen = { stream: MediaStream; id: string };
 
 const settings = definePluginSettings({
@@ -146,11 +146,13 @@ function control(message: any) {
         }
         lastSpeakers = speakers;
     } else if (message.op === "ended") {
-        if (connection.rtc.isStreamSender()) endCapture();
+        const recoverable = !connection.rtc.isStreamSender() || !!message.recoverable;
+        connection.ended = true;
+        if (connection.rtc.isStreamSender() && !recoverable) endCapture();
         connection.ready = false;
         connection.rtc.setState("RTC_DISCONNECTED");
-        if (!connection.rtc.isStreamSender()) connection.rtc._scheduleReconnect();
-        if (message.error) toast("Relay: " + message.error);
+        if (recoverable) connection.rtc._scheduleReconnect();
+        if (message.error && !recoverable) toast("Relay: " + message.error);
     } else if (message.op === "state") {
         const ready = !!message.ready;
         if (ready !== connection.ready) {
@@ -464,7 +466,19 @@ const plugin = definePlugin({
     handles(rtc: RTC) { return this.usesNativeVoice() && (rtc.context === "default" || rtc.isStreamSender()); },
     owns(rtc: RTC) { return connections.has(rtc); },
     connect(rtc: RTC, endpoint: string | null, token: string | null) {
-        this.disconnect(rtc);
+        const existing = connections.get(rtc);
+        if (existing && !existing.ended && rtc.isStreamSender() && endpoint && token && !rtc._destroyed) {
+            rtc._cancelReconnect();
+            rtc._cleanupSocket();
+            if (rtc._nextChannelId) { rtc._channelId = rtc._nextChannelId; rtc._nextChannelId = undefined; }
+            rtc.endpoint = endpoint;
+            rtc.token = token;
+            existing.ready = false;
+            rtc.setState("RTC_CONNECTING");
+            send({ op: "reconnect", id: existing.id, endpoint: endpoint.replace(/^wss?:\/\//, "").replace(/\/$/, ""), token });
+            return;
+        }
+        this.disconnect(rtc, !!(existing?.ended && rtc.isStreamSender() && !rtc._destroyed));
         if (rtc._destroyed) return;
         rtc._cancelReconnect();
         rtc._cleanupSocket();
@@ -487,13 +501,13 @@ const plugin = definePlugin({
             if (active && connections.get(rtc) === connection) fail(error.message);
         });
     },
-    disconnect(rtc: RTC) {
+    disconnect(rtc: RTC, keepCapture = false) {
         const connection = connections.get(rtc);
         if (!connection) return;
-        send({ op: "stop", id: connection.id });
+        if (!connection.ended) send({ op: "stop", id: connection.id });
         connections.delete(rtc);
-        if (rtc.isStreamSender()) endCapture();
-        if (connection.owner) {
+        if (rtc.isStreamSender() && !keepCapture) endCapture();
+        if (connection.owner && !keepCapture) {
             playback?.removeScreen(connection.owner);
             const screen = screens.get(connection.owner);
             if (screen) { registry.remove(screen.id); screen.stream.getTracks().forEach(t => t.stop()); screens.delete(connection.owner); }
@@ -501,7 +515,7 @@ const plugin = definePlugin({
         if (!connection.owner) {
             for (const child of [...connections.values()]) this.disconnect(child.rtc);
         }
-        if (!connections.size) closePlayback();
+        if (!connections.size && !keepCapture) closePlayback();
     },
     start() {
         active = true;
