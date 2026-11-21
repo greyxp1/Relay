@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -15,7 +16,7 @@ pub(super) struct Packet {
     pub timestamp: u32,
     pub marker: bool,
     pub original_sequence: Option<u16>,
-    pub payload: Vec<u8>,
+    pub payload: Rc<Vec<u8>>,
     /// Sent while a probe cluster runs.
     pub probe: bool,
     /// A probe copy of an already delivered packet.
@@ -33,7 +34,7 @@ struct History {
     sequence: u16,
     timestamp: u32,
     marker: bool,
-    payload: Vec<u8>,
+    payload: Rc<Vec<u8>>,
     sent: Instant,
     repairs: u8,
     last_repair: Option<Instant>,
@@ -316,7 +317,7 @@ impl Pacer {
                                     timestamp: entry.timestamp,
                                     marker: entry.marker,
                                     original_sequence: Some(*sequence),
-                                    payload: entry.payload.clone(),
+                                    payload: Rc::clone(&entry.payload),
                                     probe: self.probe.is_some(),
                                     duplicate: false,
                                 },
@@ -337,7 +338,7 @@ impl Pacer {
                     timestamp: frame.timestamp,
                     marker: frame.payloads.is_empty(),
                     original_sequence: None,
-                    payload,
+                    payload: Rc::new(payload),
                     probe: self.probe.is_some(),
                     duplicate: false,
                 };
@@ -362,7 +363,7 @@ impl Pacer {
             timestamp: entry.timestamp,
             marker: entry.marker,
             original_sequence: Some(entry.sequence),
-            payload: entry.payload.clone(),
+            payload: Rc::clone(&entry.payload),
             probe: true,
             duplicate: true,
         };

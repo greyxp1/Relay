@@ -287,28 +287,51 @@ impl Rate {
             return;
         };
         let cluster = Some(self.cluster);
-        let packets: Vec<_> = self.sent.iter().filter(|e| e.cluster == cluster).collect();
-        let finished = self.sent.back().is_some_and(|e| e.cluster != cluster)
-            && packets.iter().all(|e| e.reported);
+        let mut total = 0usize;
+        let mut all_reported = true;
+        let mut first_at: Option<Instant> = None;
+        let mut last_at: Option<Instant> = None;
+        let mut last_bytes = 0u32;
+        let mut send_bytes = 0.0f64;
+        let mut received_count = 0usize;
+        let mut earliest_arrival = i64::MAX;
+        let mut earliest_bytes = 0u32;
+        let mut latest_arrival = i64::MIN;
+        let mut receive_bytes = 0.0f64;
+        for entry in self.sent.iter().filter(|e| e.cluster == cluster) {
+            total += 1;
+            all_reported &= entry.reported;
+            if first_at.is_none() {
+                first_at = Some(entry.at);
+            }
+            last_at = Some(entry.at);
+            last_bytes = entry.bytes;
+            send_bytes += f64::from(entry.bytes);
+            if let Some(arrival) = entry.arrival {
+                received_count += 1;
+                if arrival < earliest_arrival {
+                    earliest_arrival = arrival;
+                    earliest_bytes = entry.bytes;
+                }
+                if arrival > latest_arrival {
+                    latest_arrival = arrival;
+                }
+                receive_bytes += f64::from(entry.bytes);
+            }
+        }
+        let finished = self.sent.back().is_some_and(|e| e.cluster != cluster) && all_reported;
         if !finished && now.saturating_duration_since(started) < Duration::from_secs(1) {
             return;
         }
         self.probe = None;
-        let received: Vec<_> = packets.iter().filter(|e| e.arrival.is_some()).collect();
         let result = (|| {
-            if received.len() < 5 || received.len() * 5 < packets.len() * 4 {
+            if received_count < 5 || received_count * 5 < total * 4 {
                 return None;
             }
-            let first = packets.first()?;
-            let last = packets.last()?;
-            let send_span = last.at.duration_since(first.at).as_micros() as f64;
-            let send_bytes =
-                packets.iter().map(|e| f64::from(e.bytes)).sum::<f64>() - f64::from(last.bytes);
-            let earliest = received.iter().min_by_key(|e| e.arrival)?;
-            let latest = received.iter().filter_map(|e| e.arrival).max()?;
-            let receive_span = (latest - earliest.arrival?) as f64;
-            let receive_bytes = received.iter().map(|e| f64::from(e.bytes)).sum::<f64>()
-                - f64::from(earliest.bytes);
+            let send_span = last_at?.duration_since(first_at?).as_micros() as f64;
+            let send_bytes = send_bytes - f64::from(last_bytes);
+            let receive_span = (latest_arrival - earliest_arrival) as f64;
+            let receive_bytes = receive_bytes - f64::from(earliest_bytes);
             if send_span < 1000.0 || receive_span < 1000.0 {
                 return None;
             }

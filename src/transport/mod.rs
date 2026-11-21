@@ -227,6 +227,20 @@ async fn camera_keyframe(requests: &mut Option<watch::Receiver<()>>) {
     }
 }
 
+async fn seal_and_send(
+    cipher: Option<&mut rtp::Cipher>,
+    udp: Option<&UdpSocket>,
+    header: &[u8],
+    data: &[&[u8]],
+) -> Result<(), String> {
+    let packet = cipher.ok_or("Transport key missing")?.seal(header, data)?;
+    udp.ok_or("UDP missing")?
+        .send(packet)
+        .await
+        .map_err(|_| "Voice UDP send failed")?;
+    Ok(())
+}
+
 async fn receive(socket: Option<&UdpSocket>, buffer: &mut [u8]) -> std::io::Result<usize> {
     match socket {
         Some(socket) => socket.recv(buffer).await,
@@ -580,18 +594,7 @@ impl<'a> Call<'a> {
     }
 
     async fn send_sealed(&mut self, header: &[u8], data: &[&[u8]]) -> Result<(), String> {
-        let packet = self
-            .cipher
-            .as_mut()
-            .ok_or("Transport key missing")?
-            .seal(header, data)?;
-        self.udp
-            .as_ref()
-            .ok_or("UDP missing")?
-            .send(&packet)
-            .await
-            .map_err(|_| "Voice UDP send failed")?;
-        Ok(())
+        seal_and_send(self.cipher.as_mut(), self.udp.as_ref(), header, data).await
     }
 
     fn request_keyframe(&mut self) -> Result<(), String> {
@@ -892,9 +895,9 @@ impl<'a> Call<'a> {
         if video {
             let limit = rtp::MTU - 54;
             let payloads = match frame.codec {
-                Codec::H265 => h265::payloads(&data, limit)?,
-                Codec::Av1 => av1::payloads(&data, frame.keyframe, limit)?,
-                _ => h264::payloads(&data, limit)?,
+                Codec::H265 => h265::payloads(data, limit)?,
+                Codec::Av1 => av1::payloads(data, frame.keyframe, limit)?,
+                _ => h264::payloads(data, limit)?,
             };
             let (pacer, _) = self.pacing.as_mut().ok_or("Video pacer missing")?;
             if !pacer.enqueue(
@@ -910,11 +913,12 @@ impl<'a> Call<'a> {
         if data.len() > rtp::MTU - 32 {
             return Err("Opus frame exceeds transport MTU".into());
         }
+        let octets = data.len();
         // Audio never waits behind the video pacer or its repair budget.
         let sender = &self.audio_sender;
         let header = rtp::header(sender.sequence, timestamp, ssrc, sender.packets == 0);
-        self.send_sealed(&header, &[&data]).await?;
-        self.audio_sender.sent(Some(timestamp), data.len());
+        seal_and_send(self.cipher.as_mut(), self.udp.as_ref(), &header, &[data]).await?;
+        self.audio_sender.sent(Some(timestamp), octets);
         Ok(())
     }
 

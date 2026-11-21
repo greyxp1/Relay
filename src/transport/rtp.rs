@@ -229,36 +229,41 @@ pub(super) struct Cipher {
     aes: Aes256Gcm,
     // Shared by RTP and RTCP. A new key is mandatory before exhaustion.
     counter: u64,
+    scratch: Vec<u8>,
 }
 impl Cipher {
     pub(super) fn new(key: &[u8]) -> Result<Self, String> {
         Ok(Self {
             aes: Aes256Gcm::new_from_slice(key).map_err(|_| "Invalid transport key")?,
             counter: 0,
+            scratch: Vec::with_capacity(MTU + 64),
         })
     }
-    pub(super) fn seal(&mut self, header: &[u8], data: &[&[u8]]) -> Result<Vec<u8>, String> {
+    pub(super) fn seal(&mut self, header: &[u8], data: &[&[u8]]) -> Result<&[u8], String> {
         let count = u32::try_from(self.counter).map_err(|_| "Transport nonce exhausted")?;
         self.counter += 1;
         let mut nonce = [0; 12];
         nonce[..4].copy_from_slice(&count.to_be_bytes());
-        let mut packet =
-            Vec::with_capacity(header.len() + data.iter().map(|p| p.len()).sum::<usize>() + 20);
-        packet.extend_from_slice(header);
+        let needed = header.len() + data.iter().map(|p| p.len()).sum::<usize>() + 20;
+        self.scratch.clear();
+        if self.scratch.capacity() < needed {
+            self.scratch.reserve(needed);
+        }
+        self.scratch.extend_from_slice(header);
         for part in data {
-            packet.extend_from_slice(part);
+            self.scratch.extend_from_slice(part);
         }
         let tag = self
             .aes
             .encrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
                 header,
-                &mut packet[header.len()..],
+                &mut self.scratch[header.len()..],
             )
             .map_err(|_| "Transport encryption failed")?;
-        packet.extend_from_slice(&tag);
-        packet.extend(count.to_be_bytes());
-        Ok(packet)
+        self.scratch.extend_from_slice(&tag);
+        self.scratch.extend(count.to_be_bytes());
+        Ok(&self.scratch)
     }
     pub(super) fn open<'a>(&self, packet: &'a mut [u8], clear: usize) -> Option<&'a [u8]> {
         let end = packet.len().checked_sub(20)?;

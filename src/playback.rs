@@ -142,15 +142,20 @@ impl Playback {
         if frame.data.len() > 24 {
             speaker.voiced = Some(speaker.seen);
         }
-        let mut packet = Vec::with_capacity(12 + frame.data.len());
-        packet.extend_from_slice(&[0x80, 120 | (u8::from(frame.marker) << 7)]);
-        packet.extend_from_slice(&frame.sequence.to_be_bytes());
-        packet.extend_from_slice(&frame.timestamp.to_be_bytes());
-        packet.extend_from_slice(&frame.ssrc.to_be_bytes());
-        packet.extend(frame.data);
+        let mut buffer =
+            gst::Buffer::with_size(12 + frame.data.len()).map_err(|e| e.to_string())?;
+        {
+            let mut map = buffer.get_mut().unwrap().map_writable().map_err(|e| e.to_string())?;
+            map[0] = 0x80;
+            map[1] = 120 | (u8::from(frame.marker) << 7);
+            map[2..4].copy_from_slice(&frame.sequence.to_be_bytes());
+            map[4..8].copy_from_slice(&frame.timestamp.to_be_bytes());
+            map[8..12].copy_from_slice(&frame.ssrc.to_be_bytes());
+            map[12..].copy_from_slice(&frame.data);
+        }
         speaker
             .input
-            .push_buffer(gst::Buffer::from_mut_slice(packet))
+            .push_buffer(buffer)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -158,7 +163,7 @@ impl Playback {
     fn create_speaker(&self) -> Result<Speaker, String> {
         // Keep queued loss notifications so the Opus decoder can conceal missing packets.
         let bin = gst::parse::bin_from_description(
-            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=60 do-lost=true max-dropout-time=1000 max-misorder-time=500 ! rtpopusdepay ! opusdec plc=true use-inband-fec=true ! audioconvert ! audioresample ! capsfilter caps=\"audio/x-raw,format=F32LE,rate=48000,channels=2\"", true
+            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=60 do-lost=true max-dropout-time=1000 max-misorder-time=500 ! rtpopusdepay ! opusdec plc=true use-inband-fec=true ! audioconvert ! capsfilter caps=\"audio/x-raw,format=F32LE,rate=48000,channels=2\"", true
         ).map_err(|e| e.to_string())?;
         let input = bin.by_name("input").unwrap().downcast::<AppSrc>().unwrap();
         self.pipeline.add(&bin).map_err(|e| e.to_string())?;

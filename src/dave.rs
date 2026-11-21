@@ -435,7 +435,10 @@ impl Session {
         )?;
         // SAFETY: live handle. Passthrough is never enabled.
         unsafe { (api.encryptor_passthrough)(handle.ptr(), false) };
-        Ok(Encryptor { handle })
+        Ok(Encryptor {
+            handle,
+            scratch: Vec::new(),
+        })
     }
 
     /// Bound to one sender. Keep one per remote user across epochs and
@@ -510,11 +513,12 @@ fn native(codec: Codec) -> (c_int, c_int) {
 
 pub struct Encryptor {
     handle: Owned,
+    scratch: Vec<u8>,
 }
 
 impl Encryptor {
     /// Encrypt one complete Opus or encoded video frame. Errors never return plaintext.
-    pub fn encrypt(&mut self, ssrc: u32, codec: Codec, frame: &[u8]) -> Result<Vec<u8>> {
+    pub fn encrypt(&mut self, ssrc: u32, codec: Codec, frame: &[u8]) -> Result<&[u8]> {
         if frame.is_empty() {
             return Err(());
         }
@@ -527,7 +531,13 @@ impl Encryptor {
             }
             (api.assign_codec)(self.handle.ptr(), ssrc, codec);
             let capacity = (api.ciphertext_size)(self.handle.ptr(), media, frame.len());
-            let mut output = output_buffer(capacity)?;
+            if capacity == 0 {
+                return Err(());
+            }
+            self.scratch.clear();
+            if self.scratch.capacity() < capacity {
+                self.scratch.try_reserve(capacity).map_err(|_| ())?;
+            }
             let mut written = 0;
             let code = (api.encrypt)(
                 self.handle.ptr(),
@@ -535,11 +545,16 @@ impl Encryptor {
                 ssrc,
                 frame.as_ptr(),
                 frame.len(),
-                output.as_mut_ptr(),
-                output.capacity(),
+                self.scratch.as_mut_ptr(),
+                self.scratch.capacity(),
                 &mut written,
             );
-            finish_frame(code, output, written)
+            if code != 0 || written == 0 || written > self.scratch.capacity() {
+                return Err(());
+            }
+            // SAFETY: a successful SDK call initialized exactly `written` output bytes.
+            self.scratch.set_len(written);
+            Ok(&self.scratch)
         }
     }
 }
