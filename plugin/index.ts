@@ -45,7 +45,6 @@ type Connection = { id: string; rtc: RTC; owner?: string; source?: string; ready
 type Screen = { stream: MediaStream; id: string };
 
 const settings = definePluginSettings({
-    source: { type: OptionType.STRING, description: "Video device to share, empty for screen or window picker", hidden: true, default: "" },
     autoShare: { type: OptionType.BOOLEAN, description: "Start sharing with saved settings when joining voice", hidden: true, default: false },
     preferences: { type: OptionType.COMPONENT, component: (): React.ReactNode => React.createElement(RelaySettings, { settings }) },
 });
@@ -109,17 +108,6 @@ function closePlayback() {
     lastSpeakers.clear();
 }
 function control(message: any) {
-    if (message.op === "cameraEnded") {
-        const owner = "camera:" + message.user;
-        const screen = screens.get(owner);
-        if (screen) {
-            registry.remove(screen.id);
-            screen.stream.getTracks().forEach(track => track.stop());
-            screens.delete(owner);
-            playback?.removeScreen(owner);
-        }
-        return;
-    }
     if (message.op === "deviceError") { toast("Relay: " + message.error); return; }
     if (message.op === "captureEnded") {
         endCapture();
@@ -181,8 +169,8 @@ function screenStream(owner: string, stream: MediaStream) {
         screen = { stream, id: registry.add(stream) };
         screens.set(owner, screen);
         for (const connection of connections.values()) {
-            if (owner.startsWith("camera:") ? !connection.owner && connection.rtc.context === "default" : connection.owner === owner) {
-                connection.rtc.emit("video", connection.rtc.guildId, connection.rtc.channelId, owner.replace(/^camera:/, ""), screen.id, connection.rtc.trueServerId);
+            if (connection.owner === owner) {
+                connection.rtc.emit("video", connection.rtc.guildId, connection.rtc.channelId, owner, screen.id, connection.rtc.trueServerId);
             }
         }
     }
@@ -194,7 +182,7 @@ async function ensurePlayback() {
         const current = new BrowserPlayback((message, owner, recover) => {
             if (playback !== current) return;
             if (recover && owner) {
-                const connection = [...connections.values()].find(c => owner.startsWith("camera:") ? !c.owner && c.rtc.context === "default" : c.owner === owner);
+                const connection = [...connections.values()].find(c => c.owner === owner);
                 if (connection) send({ op: "keyframe", id: connection.id });
             } else if (message) {
                 if (owner) toast("Relay: " + message);
@@ -259,14 +247,14 @@ async function nativeCapture(options?: DisplayMediaStreamOptions): Promise<Media
     }
     if (preparing) throw new DOMException("A screen picker is already open", "InvalidStateError");
     const changing = [...connections.values()].find(connection => connection.rtc.isStreamSender());
-    const initial = { ...getShareQuality(), source: settings.store.source, autoShare: settings.store.autoShare };
+    const initial = { ...getShareQuality(), autoShare: settings.store.autoShare };
     const interactive = !automaticCapture;
-    const { source, autoShare, ...quality } = interactive ? await selectShare(initial, !!changing) : initial;
+    const { autoShare, ...quality } = interactive ? await selectShare(initial, !!changing) : initial;
     const current = await ensurePlayback();
     const id = crypto.randomUUID();
     await new Promise<void>((resolve, reject) => {
         preparing = { id, resolve, reject };
-        send({ op: "prepareShare", id, ...quality, source: source || null, replace: changing?.id });
+        send({ op: "prepareShare", id, ...quality, replace: changing?.id });
     });
     // Discord uses this track for source lifetime and preview. Native media owns encoding.
     let stream: MediaStream;
@@ -281,7 +269,6 @@ async function nativeCapture(options?: DisplayMediaStreamOptions): Promise<Media
     if (!track) { send({ op: "cancelShare" }); throw new Error("Native preview is unavailable"); }
     if (interactive) {
         saveShareQuality(quality);
-        settings.store.source = source;
         settings.store.autoShare = autoShare;
     }
     captureTrack?.stop();
@@ -316,13 +303,6 @@ const plugin = definePlugin({
         replacement: {
             match: /(style:\{paddingTop:4,height:"auto"\},className:\i\.\i\[\i\],children:)(\i)/,
             replace: "$1$self.voiceStatus($2)",
-        },
-    }, {
-        // The desktop native engine cannot consume Relay's MediaStreams.
-        find: '"cameraBackgroundLive"',
-        replacement: {
-            match: /\[(\i\.\i)\.NATIVE,\1\.WEBRTC\](?=\.find)/,
-            replace: "[$1.WEBRTC]",
         },
     }, {
         find: "RTCConnection.connect(...): Attempting to connect on destroyed instance.",

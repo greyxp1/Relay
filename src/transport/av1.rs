@@ -1,5 +1,6 @@
 //! AV1 RTP payload format packetization of a low overhead OBU stream.
 //! DAVE leaves every size field but the last, which also covers its trailer.
+use super::pacer::Payloads;
 use std::borrow::Cow;
 
 fn leb128(mut value: usize, out: &mut Vec<u8>) {
@@ -28,8 +29,7 @@ fn obus(frame: &[u8]) -> Result<Vec<Cow<'_, [u8]>>, String> {
         }
         let mut start = at + 1 + usize::from(extension);
         let end = if header & 2 != 0 {
-            let mut size = 0;
-            let mut shift = 0;
+            let (mut size, mut shift) = (0, 0);
             loop {
                 let byte = *frame.get(start).ok_or(INVALID)?;
                 size |= usize::from(byte & 127) << shift;
@@ -46,20 +46,18 @@ fn obus(frame: &[u8]) -> Result<Vec<Cow<'_, [u8]>>, String> {
         } else {
             frame.len()
         };
-        if start > frame.len() || end > frame.len() {
+        if start > end || end > frame.len() {
             return Err(INVALID.into());
         }
         if !matches!((header >> 3) & 15, 2 | 8 | 15) {
-            if header & 2 == 0 {
-                obus.push(Cow::Borrowed(&frame[at..end]));
+            obus.push(if header & 2 == 0 {
+                Cow::Borrowed(&frame[at..end])
             } else {
                 let mut obu = vec![header & !2];
-                if extension {
-                    obu.push(frame[at + 1]);
-                }
+                obu.extend_from_slice(&frame[at + 1..at + 1 + usize::from(extension)]);
                 obu.extend_from_slice(&frame[start..end]);
-                obus.push(Cow::Owned(obu));
-            }
+                Cow::Owned(obu)
+            });
         }
         at = end;
     }
@@ -70,7 +68,7 @@ fn obus(frame: &[u8]) -> Result<Vec<Cow<'_, [u8]>>, String> {
 }
 
 /// Packets of whole or fragmented OBU elements. A single element omits its length.
-pub(super) fn payloads(frame: &[u8], keyframe: bool, limit: usize) -> Result<Vec<Vec<u8>>, String> {
+pub(super) fn payloads(frame: &[u8], keyframe: bool, limit: usize) -> Result<Payloads, String> {
     let obus = obus(frame)?;
     // N marks a keyframe that starts with its sequence header.
     let mut first = if keyframe && (obus[0][0] >> 3) & 15 == 1 {
@@ -78,26 +76,34 @@ pub(super) fn payloads(frame: &[u8], keyframe: bool, limit: usize) -> Result<Vec
     } else {
         0
     };
-    let mut payloads = Vec::new();
+    let mut payloads = Payloads::default();
+    // Elements of the open packet: bytes, continued from and continuing into another packet.
     let mut elements: Vec<(&[u8], bool, bool)> = Vec::new();
     let mut used = 1;
     let mut flush = |elements: &mut Vec<(&[u8], bool, bool)>, used: &mut usize| {
-        let continued = elements.first().is_some_and(|e| e.1);
-        let continues = elements.last().is_some_and(|e| e.2);
         let single = elements.len() == 1;
-        let mut payload = vec![
+        let payload = payloads.open();
+        payload.push(
             first
-                | if continued { 0x80 } else { 0 }
-                | if continues { 0x40 } else { 0 }
+                | if elements.first().is_some_and(|e| e.1) {
+                    0x80
+                } else {
+                    0
+                }
+                | if elements.last().is_some_and(|e| e.2) {
+                    0x40
+                } else {
+                    0
+                }
                 | if single { 0x10 } else { 0 },
-        ];
+        );
         for (element, ..) in elements.drain(..) {
             if !single {
-                leb128(element.len(), &mut payload);
+                leb128(element.len(), payload);
             }
             payload.extend_from_slice(element);
         }
-        payloads.push(payload);
+        payloads.close();
         first = 0;
         *used = 1;
     };

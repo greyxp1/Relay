@@ -1,45 +1,15 @@
 import "./share.css";
 
 import { FormSwitch } from "@components/FormSwitch";
-import { ImageIcon, ScreenshareIcon } from "@components/Icons";
 import { Text } from "@components/Text";
 import { getUserSettingLazy } from "@api/UserSettings";
-import { IS_WINDOWS } from "@utils/constants";
 import { findByCodeLazy, findByPropsLazy } from "@webpack";
 import { ApplicationStreamingSettingsStore, closeModal, Modal, openModal, React, Select, TextInput, useState, useStateFromStores } from "@webpack/common";
 import type { RenderModalProps } from "@vencord/discord-types";
 
 export type ShareQuality = { height: number; fps: number; audio: boolean; preview: boolean };
-type SharePreferences = { source: string; autoShare: boolean };
-type ShareOptions = ShareQuality & SharePreferences;
-type VideoDevice = { id: string; name: string; screen?: boolean };
+type ShareOptions = ShareQuality & { autoShare: boolean };
 
-function useVideoDevices() {
-    const [devices, setDevices] = useState<VideoDevice[]>();
-    const [error, setError] = useState("");
-    React.useEffect(() => {
-        setDevices(undefined);
-        setError("");
-        const socket = new WebSocket("ws://127.0.0.1:38446/media");
-        let received = false;
-        const timeout = setTimeout(() => socket.close(), 5000);
-        socket.onopen = () => socket.send(JSON.stringify({ op: "videoDevices" }));
-        socket.onmessage = event => {
-            const message = JSON.parse(event.data);
-            if (message.op !== "videoDevices") return;
-            received = true;
-            if (message.error) setError(message.error);
-            setDevices([...(message.screens ?? []).map(device => ({ ...device, screen: true })), ...(message.devices ?? [])]);
-            socket.close();
-        };
-        socket.onclose = () => {
-            clearTimeout(timeout);
-            if (!received) setError("Could not load media sources. Check Relay and reopen this dialog.");
-        };
-        return () => { clearTimeout(timeout); socket.onclose = null; socket.onmessage = null; socket.onopen = null; socket.close(); };
-    }, []);
-    return { devices, error };
-}
 const updateStreamSettings = findByCodeLazy('type:"STREAM_UPDATE_SETTINGS"');
 const streamPresets = findByPropsLazy("PRESET_CUSTOM");
 const disablePreviews = getUserSettingLazy<boolean>("voiceAndVideo", "disableStreamPreviews");
@@ -58,22 +28,21 @@ export function saveShareQuality(change: Partial<ShareQuality>) {
 }
 
 function validShareQuality(quality: ShareQuality) {
-    return Number.isInteger(quality.height) && (quality.height === 0 || quality.height >= 16) && quality.height <= 2160
+    return Number.isInteger(quality.height) && (quality.height === 0 || quality.height >= 128) && quality.height <= 2160
         && Number.isInteger(quality.fps) && quality.fps >= 1 && quality.fps <= 240;
 }
 
-export function RelaySettings({ settings }: { settings: { use(): SharePreferences; store: SharePreferences } }) {
-    const { source, autoShare } = settings.use();
+export function RelaySettings({ settings }: { settings: { use(): { autoShare: boolean }; store: { autoShare: boolean } } }) {
+    const { autoShare } = settings.use();
     const saved = useStateFromStores([ApplicationStreamingSettingsStore], () => ApplicationStreamingSettingsStore.getState());
     const preview = !disablePreviews?.useSetting();
-    const discovery = useVideoDevices();
-    return <ShareControls value={{ source, autoShare, height: saved.resolution, fps: saved.fps, audio: saved.soundshareEnabled, preview }}
-        {...discovery} onChange={change => {
+    return <ShareControls value={{ autoShare, height: saved.resolution, fps: saved.fps, audio: saved.soundshareEnabled, preview }}
+        onChange={change => {
             saveShareQuality(change);
-            if (change.source !== undefined) settings.store.source = change.source;
             if (change.autoShare !== undefined) settings.store.autoShare = change.autoShare;
         }} />;
 }
+
 const resolutions = [0, 480, 720, 1080, 1440, 2160];
 const frameRates = [15, 30, 60, 120, 144, 240];
 // Discord's field props are supported at runtime but missing from discord-types.
@@ -124,33 +93,11 @@ function QualityControl({ label, unit, value, minimum, maximum, presets, format,
     </div>;
 }
 
-function ShareControls({ value, devices, error, onChange }: {
-    value: ShareOptions; devices?: VideoDevice[]; error: string; onChange: (change: Partial<ShareOptions>) => void;
-}) {
-    const id = React.useId();
-    const screen = devices?.find(device => device.id === value.source)?.screen;
-    const missing = value.source && devices && !devices.some(device => device.id === value.source);
-    const status = error || (missing ? "This source is unavailable. Choose another source."
-        : !devices ? "Looking for media sources…"
-        : value.source ? screen ? "Share this screen or window." : "Share this device as a stream."
-        : IS_WINDOWS ? "Choose a screen, window, camera or capture card." : "Your system picker opens before sharing.");
-    const Icon = value.source && !screen ? ImageIcon : ScreenshareIcon;
+function ShareControls({ value, onChange }: { value: ShareOptions; onChange: (change: Partial<ShareOptions>) => void }) {
     return <div className="relay-form">
-        <div className="relay-source">
-            <span className="relay-source-icon" aria-hidden="true"><Icon width={22} height={22} /></span>
-            <div className="relay-source-control">
-                <QualitySelect label="Source" placeholder="Choose a source" aria-describedby={id} options={[
-                    ...(!IS_WINDOWS ? [{ value: "", label: "Screen or window…" }] : []),
-                    ...(value.source && !devices?.some(device => device.id === value.source)
-                        ? [{ value: value.source, label: `${devices ? "Unavailable source" : "Saved source"} (${value.source})` }] : []),
-                    ...(devices?.map(device => ({ value: device.id, label: device.name })) ?? []),
-                ]} select={source => onChange({ source })} isSelected={source => source === value.source} serialize={String} closeOnSelect />
-                <p id={id} className={error || missing ? "relay-error" : "relay-status"} role="status">{status}</p>
-            </div>
-        </div>
         <div className="relay-quality-row">
             <QualityControl label="Resolution" unit="px"
-                value={value.height} minimum={16} maximum={2160} presets={resolutions}
+                value={value.height} minimum={128} maximum={2160} presets={resolutions}
                 format={height => height === 0 ? "Source" : `${height}p`} onChange={height => onChange({ height })} />
             <QualityControl label="Frame rate" unit="fps"
                 value={value.fps} minimum={1} maximum={240} presets={frameRates}
@@ -162,7 +109,7 @@ function ShareControls({ value, devices, error, onChange }: {
         </div>
         <div className="relay-auto-share">
             <FormSwitch title="Share automatically on join" hideBorder
-                description={value.source ? "Start this source with these quality settings." : IS_WINDOWS ? "Choose a source above to share when you join voice." : "Open the screen/window picker when you join voice."}
+                description="Open the screen/window picker when you join voice."
                 value={value.autoShare} onChange={autoShare => onChange({ autoShare })} />
         </div>
     </div>;
@@ -172,13 +119,11 @@ function ShareDialog({ initial, changing, submit, ...props }: RenderModalProps &
     initial: ShareOptions; changing: boolean; submit: (value: ShareOptions) => void;
 }) {
     const [value, setValue] = useState(initial);
-    const discovery = useVideoDevices();
-    const valid = validShareQuality(value) && (value.source ? discovery.devices?.some(device => device.id === value.source) : !IS_WINDOWS);
     return <Modal {...props} title={changing ? "Change stream" : "Share your screen"}
-        subtitle="Choose a source and your stream quality." size="lg"
-        actions={[{ text: !IS_WINDOWS && !value.source ? "Choose screen or window" : changing ? "Apply changes" : "Start sharing", variant: "primary", disabled: !valid,
+        subtitle="Choose your stream quality. Your system picker opens next." size="lg"
+        actions={[{ text: "Choose screen or window", variant: "primary", disabled: !validShareQuality(value),
             onClick: () => { submit(value); props.onClose(); } }]}>
-        <ShareControls value={value} {...discovery} onChange={change => setValue(value => ({ ...value, ...change }))} />
+        <ShareControls value={value} onChange={change => setValue(value => ({ ...value, ...change }))} />
     </Modal>;
 }
 

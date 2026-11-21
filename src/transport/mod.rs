@@ -29,7 +29,6 @@ use tokio_tungstenite::{
 };
 use zeroize::Zeroizing;
 mod av1;
-mod camera;
 mod h264;
 mod h265;
 mod mls;
@@ -63,8 +62,6 @@ pub enum Mode {
         input: mpsc::Receiver<capture::Frame>,
         output: mpsc::Sender<ReceivedFrame>,
         speaking: watch::Receiver<bool>,
-        video: mpsc::Sender<(u64, Option<camera::Picture>)>,
-        keyframes: watch::Receiver<()>,
     },
     /// The caller must force a capture keyframe for each bounded request notification.
     /// `codecs` lists what capture can encode. `codec` starts as the codec capture
@@ -80,12 +77,6 @@ pub enum Mode {
     },
 }
 
-impl Mode {
-    fn video(&self) -> bool {
-        !matches!(self, Self::Voice { .. })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Status {
     /// True when the voice gateway and encrypted UDP transport are established.
@@ -95,16 +86,11 @@ pub struct Status {
     pub ping: u32,
 }
 
-/// Decrypted Opus and its RTP timing, ready for native playback.
+/// A decrypted Opus RTP packet from `user`, ready for native playback.
 pub struct ReceivedFrame {
-    pub marker: bool,
-    pub ssrc: u32,
-    pub sequence: u16,
-    /// The sending user, mapped from its SSRC by Speaking events.
     pub user: u64,
-    /// Wrapping RTP ticks at the codec's clock rate.
-    pub timestamp: u32,
-    pub data: Vec<u8>,
+    pub ssrc: u32,
+    pub packet: Vec<u8>,
 }
 
 /// Cancel by dropping the future. Errors are sanitized.
@@ -137,18 +123,11 @@ async fn binary(ws: &mut Socket, op: u8, bytes: Vec<u8>) -> Result<(), String> {
     if bytes.len() > 1024 * 1024 {
         return Err("DAVE output exceeded limit".into());
     }
-    let mut payload = Vec::with_capacity(bytes.len() + 1);
-    payload.push(op);
-    payload.extend(bytes);
-    send(ws, Message::Binary(payload.into())).await
-}
-fn number(v: &Value, key: &str) -> Result<u64, String> {
-    v[key]
-        .as_u64()
-        .ok_or_else(|| "Malformed voice control message".into())
+    send(ws, Message::Binary([&[op], &bytes[..]].concat().into())).await
 }
 fn int<T: TryFrom<u64>>(v: &Value, key: &str) -> Result<T, String> {
-    T::try_from(number(v, key)?).map_err(|_| "Voice control integer out of range".into())
+    let value = v[key].as_u64().ok_or("Malformed voice control message")?;
+    T::try_from(value).map_err(|_| "Voice control integer out of range".into())
 }
 fn codec_name(codec: Codec) -> &'static str {
     match codec {
@@ -168,19 +147,17 @@ fn id(v: &Value) -> Result<String, String> {
         .ok_or_else(|| "Malformed voice user ID".into())
 }
 fn version(v: &Value, key: &str, max: u16) -> Result<u16, String> {
-    let value = int(v, key)?;
-    if value == 0 || value > max {
-        return Err("Unsupported DAVE version, plaintext forbidden".into());
-    }
-    Ok(value)
+    int(v, key)
+        .ok()
+        .filter(|value| (1..=max).contains(value))
+        .ok_or_else(|| "Unsupported DAVE version, plaintext forbidden".into())
 }
 fn endpoint(value: &str) -> Result<String, String> {
     // Gateway supplies a host[:port], never an arbitrary application URL.
     let (host, port) = value
         .split_once(':')
         .map_or((value, None), |(h, p)| (h, Some(p)));
-    if host.is_empty()
-        || host.len() > 253
+    if host.len() > 253
         || !host.ends_with(".discord.media")
         || !host
             .bytes()
@@ -196,10 +173,8 @@ async fn next_frame(mode: &mut Mode, video_ready: bool) -> Option<capture::Frame
     match mode {
         Mode::Voice { input, .. } => input.recv().await,
         Mode::GoLive {
-            video: input,
-            audio: None,
-            ..
-        } if video_ready => input.recv().await,
+            video, audio: None, ..
+        } if video_ready => video.recv().await,
         Mode::GoLive {
             video,
             audio: Some(audio),
@@ -216,29 +191,6 @@ async fn sleep_until(deadline: Option<std::time::Instant>) {
         Some(deadline) => time::sleep_until(Instant::from_std(deadline)).await,
         None => std::future::pending().await,
     }
-}
-
-async fn camera_keyframe(requests: &mut Option<watch::Receiver<()>>) {
-    match requests {
-        Some(keyframes) => {
-            let _ = keyframes.changed().await;
-        }
-        _ => std::future::pending().await,
-    }
-}
-
-async fn seal_and_send(
-    cipher: Option<&mut rtp::Cipher>,
-    udp: Option<&UdpSocket>,
-    header: &[u8],
-    data: &[&[u8]],
-) -> Result<(), String> {
-    let packet = cipher.ok_or("Transport key missing")?.seal(header, data)?;
-    udp.ok_or("UDP missing")?
-        .send(packet)
-        .await
-        .map_err(|_| "Voice UDP send failed")?;
-    Ok(())
 }
 
 async fn receive(socket: Option<&UdpSocket>, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -325,11 +277,6 @@ struct Call<'a> {
     last_keyframe_request: Option<Instant>,
     media_epoch: Option<u64>,
     next_report: Instant,
-    cameras: BTreeMap<u32, camera::Camera>,
-    pictures: mpsc::Sender<camera::Picture>,
-    incoming_pictures: mpsc::Receiver<camera::Picture>,
-    next_camera_keyframe: Instant,
-    camera_requests: Option<watch::Receiver<()>>,
 }
 
 impl<'a> Call<'a> {
@@ -339,8 +286,7 @@ impl<'a> Call<'a> {
         on_status: &'a mut dyn FnMut(Status),
     ) -> Result<Self, String> {
         let mut status = Status::default();
-        let mut video_codec = Codec::H264;
-        let pacing = match &mode {
+        let (video, video_codec, pacing) = match &mode {
             Mode::GoLive {
                 settings,
                 codecs,
@@ -351,47 +297,41 @@ impl<'a> Call<'a> {
                 if codecs.is_empty() || codecs.contains(&Codec::Opus) {
                     return Err("Invalid stream video codecs".into());
                 }
-                video_codec = *codec.borrow();
                 let now = std::time::Instant::now();
                 let rate = rate::Rate::new(settings.bitrate, now);
                 status.video_bitrate = rate.bitrate();
-                Some((pacer::Pacer::new(rate.bitrate(), now), rate))
+                (
+                    true,
+                    *codec.borrow(),
+                    Some((pacer::Pacer::new(rate.bitrate(), now), rate)),
+                )
             }
-            _ => None,
+            Mode::Voice { .. } => (false, Codec::H264, None),
         };
-        let channel = c
+        let group = c
             .channel_id
             .parse::<u64>()
             .map_err(|_| "Invalid channel ID")?;
         if !valid_id(&c.user_id) || !valid_id(&c.server_id) {
             return Err("Malformed voice user ID".into());
         }
-        if c.session_id.is_empty()
-            || c.token.is_empty()
-            || c.session_id.len() > 4096
-            || c.token.len() > 4096
-        {
+        if !(1..=4096).contains(&c.session_id.len()) || !(1..=4096).contains(&c.token.len()) {
             return Err("Invalid voice credentials".into());
         }
-        let max_version = dave::DaveLibrary::load()
-            .map_err(|_| "DAVE library unavailable")?
-            .max_supported_protocol_version();
+        let library = dave::DaveLibrary::load().map_err(|_| "DAVE library unavailable")?;
+        let max_version = library.max_supported_protocol_version();
         if max_version == 0 {
             return Err("Encrypted DAVE unavailable".into());
         }
         let config = WebSocketConfig::default()
             .max_message_size(Some(1024 * 1024))
             .max_frame_size(Some(1024 * 1024));
-        let (mut ws, _) = time::timeout(
-            Duration::from_secs(15),
-            connect_async_with_config(endpoint(&c.endpoint)?, Some(config), false),
-        )
-        .await
-        .map_err(|_| "Voice websocket connection timed out")?
-        .map_err(|_| "Voice websocket connection failed")?;
-        let video = mode.video();
-        let mut identify = json!({"server_id":c.server_id,"channel_id":c.channel_id,"user_id":c.user_id,"session_id":c.session_id.as_str(),"token":c.token.as_str(),"max_dave_protocol_version":max_version});
-        identify["video"] = json!(true);
+        let connection = connect_async_with_config(endpoint(&c.endpoint)?, Some(config), false);
+        let (mut ws, _) = time::timeout(Duration::from_secs(15), connection)
+            .await
+            .map_err(|_| "Voice websocket connection timed out")?
+            .map_err(|_| "Voice websocket connection failed")?;
+        let mut identify = json!({"server_id":c.server_id,"channel_id":c.channel_id,"user_id":c.user_id,"session_id":c.session_id.as_str(),"token":c.token.as_str(),"max_dave_protocol_version":max_version,"video":true});
         if video {
             identify["streams"] = json!([{"type":"screen","rid":"100","quality":100}]);
         }
@@ -402,11 +342,6 @@ impl<'a> Call<'a> {
             DEADLINE
         };
         let now = Instant::now();
-        let (pictures, incoming_pictures) = mpsc::channel(8);
-        let camera_requests = match &mode {
-            Mode::Voice { keyframes, .. } => Some(keyframes.clone()),
-            _ => None,
-        };
         Ok(Self {
             mode,
             identity: c.identity,
@@ -419,7 +354,7 @@ impl<'a> Call<'a> {
             ssrc_users: BTreeMap::new(),
             mls: None,
             external: None,
-            group: channel,
+            group,
             dave_ready: false,
             recoveries: 0,
             seq_ack: -1,
@@ -444,11 +379,6 @@ impl<'a> Call<'a> {
             last_keyframe_request: None,
             media_epoch: None,
             next_report: now + Duration::from_secs(5),
-            cameras: BTreeMap::new(),
-            pictures,
-            incoming_pictures,
-            next_camera_keyframe: now,
-            camera_requests,
         })
     }
 
@@ -458,23 +388,13 @@ impl<'a> Call<'a> {
         let mut buffer = [0; 4096];
         loop {
             self.pacer_upkeep()?;
-            let deadline = self
-                .pacing
-                .as_ref()
-                .and_then(|(pacer, _)| pacer.deadline(std::time::Instant::now()));
+            let pacer = self.pacing.as_ref().map(|(pacer, _)| pacer);
+            let deadline = pacer.and_then(|pacer| pacer.deadline(std::time::Instant::now()));
             // Propagate pacer pressure to raw-frame admission instead of dropping encoded references.
-            let video_ready = self
-                .pacing
-                .as_ref()
-                .is_none_or(|(pacer, _)| pacer.can_enqueue());
+            let video_ready = pacer.is_none_or(pacer::Pacer::can_enqueue);
             tokio::select! {
                 _ = sleep_until(deadline) => self.send_video().await?,
                 _ = tick.tick() => self.tick().await?,
-                Some(picture) = self.incoming_pictures.recv() => self.camera_picture(picture),
-                _ = camera_keyframe(&mut self.camera_requests) => {
-                    for camera in self.cameras.values_mut() { camera.seen = Instant::now() - Duration::from_secs(2); }
-                    self.next_camera_keyframe = Instant::now();
-                }
                 frame = next_frame(&mut self.mode, video_ready) => {
                     self.send_frame(frame.ok_or("Media input ended")?).await?;
                 }
@@ -483,9 +403,7 @@ impl<'a> Call<'a> {
                     self.on_udp(&mut buffer[..size]).await?;
                 }
                 message = self.ws.next() => {
-                    let message = message
-                        .ok_or("Voice websocket ended")?
-                        .map_err(|_| "Voice websocket receive failed")?;
+                    let message = message.ok_or("Voice websocket ended")?.map_err(|_| "Voice websocket receive failed")?;
                     self.on_message(message).await?;
                     self.update_ready().await?;
                 }
@@ -497,104 +415,21 @@ impl<'a> Call<'a> {
         (self.on_status)(self.status);
     }
 
-    async fn stop_camera(&mut self, user: &str) -> Result<(), String> {
-        let previous = self.cameras.len();
-        self.cameras.retain(|_, camera| camera.user != user);
-        if previous != self.cameras.len() {
-            if let Mode::Voice { video, .. } = &self.mode {
-                video
-                    .send((user.parse().map_err(|_| "Invalid camera user")?, None))
-                    .await
-                    .map_err(|_| "Camera receiver closed")?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn camera_streams(&mut self, data: &Value) -> Result<(), String> {
-        let user = id(&data["user_id"])?;
-        if user == self.user_id || !self.users.contains(&user) {
-            return Ok(());
-        }
-        let streams = data["streams"].as_array().filter(|s| s.len() <= 8);
-        let selected = streams.and_then(|streams| {
-            streams
-                .iter()
-                .filter(|s| s["active"].as_bool() == Some(true))
-                .max_by_key(|s| s["quality"].as_u64().unwrap_or(0))
-        });
-        let selected = selected.or_else(|| {
-            (streams.is_none() && data["video_ssrc"].as_u64().unwrap_or(0) != 0).then_some(data)
-        });
-        let Some(stream) = selected else {
-            self.stop_camera(&user).await?;
-            return Ok(());
-        };
-        let ssrc = stream["ssrc"]
-            .as_u64()
-            .or_else(|| stream["video_ssrc"].as_u64())
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0);
-        if ssrc == 0 || self.cameras.contains_key(&ssrc) {
-            return Ok(());
-        }
-        let rtx = stream["rtx_ssrc"]
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0);
-        self.stop_camera(&user).await?;
-        if self.cameras.len() >= 16 {
-            return Ok(());
-        }
-        let pictures = self.pictures.clone();
-        let camera =
-            tokio::task::spawn_blocking(move || camera::Camera::new(user, ssrc, rtx, pictures))
-                .await
-                .map_err(|_| "Camera receiver setup failed")??;
-        self.cameras.insert(ssrc, camera);
-        let wants: serde_json::Map<String, Value> = self
-            .cameras
-            .keys()
-            .map(|s| (s.to_string(), json!(100)))
-            .collect();
-        event(&mut self.ws, 15, Value::Object(wants)).await?;
-        self.next_camera_keyframe = Instant::now();
-        Ok(())
-    }
-
-    fn camera_picture(&mut self, mut picture: camera::Picture) {
-        let Some(camera) = self.cameras.get_mut(&picture.ssrc) else {
-            return;
-        };
-        let Some(decryptor) = self
-            .mls
-            .as_mut()
-            .and_then(|m| m.decryptors.get_mut(&camera.user))
-        else {
-            return;
-        };
-        let Ok(data) = decryptor.decrypt(Codec::H264, &picture.data) else {
-            picture.lost();
-            return;
-        };
-        picture.data = data;
-        let Ok(user) = camera.user.parse() else {
-            return;
-        };
-        if let Mode::Voice { video, .. } = &self.mode {
-            match video.try_send((user, Some(picture))) {
-                Ok(()) => camera.seen = Instant::now(),
-                Err(error) => error.into_inner().1.unwrap().lost(),
-            }
-        }
-    }
-
     fn media_ready(&self) -> bool {
         self.status.transport_ready && self.mls.as_ref().is_some_and(|m| m.ready)
     }
 
     async fn send_sealed(&mut self, header: &[u8], data: &[&[u8]]) -> Result<(), String> {
-        seal_and_send(self.cipher.as_mut(), self.udp.as_ref(), header, data).await
+        let packet = self
+            .cipher
+            .as_mut()
+            .ok_or("Transport key missing")?
+            .seal(header, data)?;
+        let udp = self.udp.as_ref().ok_or("UDP missing")?;
+        udp.send(packet)
+            .await
+            .map_err(|_| "Voice UDP send failed")?;
+        Ok(())
     }
 
     fn request_keyframe(&mut self) -> Result<(), String> {
@@ -621,17 +456,17 @@ impl<'a> Call<'a> {
         codec.send_if_modified(|current| std::mem::replace(current, selected) != selected);
         if selected != self.video_codec {
             self.video_codec = selected;
-            self.restart_video()?;
+            self.clear_video();
+            self.request_keyframe()?;
         }
         Ok(())
     }
 
-    /// Drops queued and repairable video, then waits for a fresh keyframe.
-    fn restart_video(&mut self) -> Result<(), String> {
+    /// Drops queued and repairable video.
+    fn clear_video(&mut self) {
         if let Some((pacer, _)) = &mut self.pacing {
             pacer.clear(std::time::Instant::now());
         }
-        self.request_keyframe()
     }
 
     fn pacer_upkeep(&mut self) -> Result<(), String> {
@@ -649,19 +484,16 @@ impl<'a> Call<'a> {
             self.need_keyframe = true;
         }
         self.need_keyframe |= pacer.expire(now);
-        if !restart && !self.paused && pacer.can_probe() {
-            if let Some(bitrate) = rate.probe(now) {
-                pacer.probe(bitrate, now);
-            }
-        }
-        if (restart && ready)
-            || (ready
-                && !self.paused
-                && self.need_keyframe
-                && self
-                    .last_keyframe_request
-                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
-        {
+        let changed = if restart || self.paused {
+            None
+        } else {
+            rate.update(now)
+        };
+        self.set_bitrate(changed);
+        let throttled = self
+            .last_keyframe_request
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1));
+        if ready && (restart || (!self.paused && self.need_keyframe && !throttled)) {
             self.request_keyframe()?;
         }
         Ok(())
@@ -685,7 +517,7 @@ impl<'a> Call<'a> {
             let sequence = sender.sequence;
             sender.sent(
                 (!repair).then_some(packet.timestamp),
-                packet.payload.len() + if repair { 2 } else { 0 },
+                packet.payload().len() + 2 * usize::from(repair),
             );
             let (header, size) = rtp::video_header(
                 sequence,
@@ -694,44 +526,20 @@ impl<'a> Call<'a> {
                 self.transport_sequence,
                 &packet,
             );
-            let transport_sequence = self.transport_sequence;
             self.transport_sequence = self.transport_sequence.wrapping_add(1);
-            self.send_sealed(&header[..16], &[&header[16..size], &packet.payload])
+            self.send_sealed(&header[..16], &[&header[16..size], packet.payload()])
                 .await?;
-            let now = std::time::Instant::now();
             let (pacer, rate) = self.pacing.as_mut().ok_or("Video pacer missing")?;
-            // Sealing adds a 16 byte tag and 4 byte nonce.
-            rate.sent(
-                transport_sequence,
-                size + packet.payload.len() + 20,
-                packet.probe,
-                now,
-            );
-            pacer.sent(sequence, packet, now);
+            if !repair {
+                rate.sent();
+            }
+            pacer.sent(sequence, packet, std::time::Instant::now());
         }
         Ok(())
     }
 
     async fn tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
-        if now >= self.next_camera_keyframe && !self.cameras.is_empty() && self.media_ready() {
-            self.next_camera_keyframe = now + Duration::from_secs(2);
-            for ssrc in self
-                .cameras
-                .iter()
-                .filter(|(_, c)| {
-                    c.recovery.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0
-                        || now.duration_since(c.seen) >= Duration::from_secs(1)
-                })
-                .map(|(ssrc, _)| *ssrc)
-                .collect::<Vec<_>>()
-            {
-                let mut pli = vec![0x81, 206, 0, 2];
-                pli.extend_from_slice(&self.ssrc.to_be_bytes());
-                pli.extend_from_slice(&ssrc.to_be_bytes());
-                self.send_sealed(&pli[..8], &[&pli[8..]]).await?;
-            }
-        }
         if self.users.len() == 1
             && self
                 .mls
@@ -740,13 +548,12 @@ impl<'a> Call<'a> {
         {
             self.startup = now + self.negotiation_timeout;
         }
-        if (!self.media_ready() && now >= self.startup)
-            || self
-                .mls
-                .as_ref()
-                .and_then(|m| m.pending)
-                .is_some_and(|p| now.duration_since(p.1) > DEADLINE)
-        {
+        let stalled = self
+            .mls
+            .as_ref()
+            .and_then(|m| m.pending)
+            .is_some_and(|p| now.duration_since(p.1) > DEADLINE);
+        if (!self.media_ready() && now >= self.startup) || stalled {
             return Err("Encrypted voice negotiation timed out".into());
         }
         if let Some(interval) = self.heartbeat {
@@ -756,10 +563,10 @@ impl<'a> Call<'a> {
                 return Err("Voice heartbeat ACK timed out".into());
             }
             if now >= self.next_heartbeat && self.ack.is_none() {
-                let nonce = SystemTime::now()
+                let clock = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_err(|_| "Invalid system clock")?
-                    .as_millis() as u64;
+                    .map_err(|_| "Invalid system clock")?;
+                let nonce = clock.as_millis() as u64;
                 event(&mut self.ws, 3, json!({"t":nonce,"seq_ack":self.seq_ack})).await?;
                 self.ack = Some((nonce, now));
                 self.next_heartbeat = now + interval;
@@ -767,7 +574,7 @@ impl<'a> Call<'a> {
         }
         if now >= self.next_report {
             let (video, rtx) = self.video_ssrc.unwrap_or((self.ssrc, self.ssrc));
-            let reports = [
+            let streams = [
                 (
                     &self.audio_sender,
                     &self.audio_sender,
@@ -781,28 +588,28 @@ impl<'a> Call<'a> {
                     self.video_codec,
                 ),
                 (&self.rtx_sender, &self.video_sender, rtx, self.video_codec),
-            ]
-            .into_iter()
-            .filter(|(sender, ..)| sender.packets != 0)
-            .map(|(sender, mapping, ssrc, codec)| {
-                let elapsed = now.duration_since(mapping.last_media).as_micros()
-                    * u128::from(codec.clock())
-                    / 1_000_000;
-                rtp::sender_report(
-                    ssrc,
-                    mapping.timestamp.wrapping_add(elapsed as u32),
-                    sender.packets,
-                    sender.octets,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            ];
+            let reports: Vec<_> = streams
+                .into_iter()
+                .filter(|(sender, ..)| sender.packets != 0)
+                .map(|(sender, mapping, ssrc, codec)| {
+                    let elapsed = now.duration_since(mapping.last_media).as_micros()
+                        * u128::from(codec.clock())
+                        / 1_000_000;
+                    rtp::sender_report(
+                        ssrc,
+                        mapping.timestamp.wrapping_add(elapsed as u32),
+                        sender.packets,
+                        sender.octets,
+                    )
+                })
+                .collect();
             if reports.is_empty() && self.cipher.is_some() {
-                let keepalive = rtp::receiver_report(self.ssrc);
-                self.send_sealed(&keepalive, &[]).await?;
-            } else {
-                for report in reports {
-                    self.send_sealed(&report[..8], &[&report[8..]]).await?;
-                }
+                self.send_sealed(&rtp::receiver_report(self.ssrc), &[])
+                    .await?;
+            }
+            for report in reports {
+                self.send_sealed(&report[..8], &[&report[8..]]).await?;
             }
             self.next_report = now + Duration::from_secs(5);
         }
@@ -820,11 +627,11 @@ impl<'a> Call<'a> {
         };
         // A mute during the write is announced too, before any send is allowed.
         while speaking.has_changed().unwrap_or(false) {
-            let on = *speaking.borrow_and_update();
+            let on = u8::from(*speaking.borrow_and_update());
             event(
                 &mut self.ws,
                 5,
-                json!({"speaking":u8::from(on),"delay":0,"ssrc":self.ssrc}),
+                json!({"speaking":on,"delay":0,"ssrc":self.ssrc}),
             )
             .await?;
         }
@@ -858,42 +665,36 @@ impl<'a> Call<'a> {
             }
             self.need_keyframe = false;
         }
-        let sender = if video {
-            &mut self.video_sender
+        let (sender, step, ssrc) = if video {
+            (
+                &mut self.video_sender,
+                1_000_000,
+                self.video_ssrc.ok_or("Video SSRC missing")?.0,
+            )
         } else {
-            &mut self.audio_sender
+            (&mut self.audio_sender, 20_000_000, self.ssrc)
         };
-        let step = if video { 1_000_000 } else { 20_000_000 };
         let pts = match sender.last_pts {
             Some(previous) if frame.pts.nseconds() <= previous => previous.saturating_add(step),
             _ => frame.pts.nseconds(),
         };
         sender.last_pts = Some(pts);
-        let timestamp = sender.origin.wrapping_add(
-            (u128::from(pts) * u128::from(frame.codec.clock()) / 1_000_000_000) as u32,
-        );
-        let ssrc = if video {
-            self.video_ssrc.ok_or("Video SSRC missing")?.0
-        } else {
-            self.ssrc
-        };
+        let ticks = u128::from(pts) * u128::from(frame.codec.clock()) / 1_000_000_000;
+        let timestamp = sender.origin.wrapping_add(ticks as u32);
         // WebRTC rewrites SPS restrictions before DAVE decryption. Make
         // that edit before authentication so receivers leave the SPS intact.
-        let plain = if frame.codec == Codec::H264 {
-            h264::normalize(&frame.data)?
-        } else {
-            Cow::Borrowed(frame.data.as_slice())
+        let plain = match frame.codec {
+            Codec::H264 => h264::normalize(&frame.data)?,
+            _ => Cow::Borrowed(frame.data.as_slice()),
         };
         // Encrypt the whole frame before adding any RTP descriptors.
-        let data = self
-            .mls
-            .as_mut()
-            .ok_or("DAVE missing")?
+        let mls = self.mls.as_mut().ok_or("DAVE missing")?;
+        let data = mls
             .encryptor
             .encrypt(ssrc, frame.codec, &plain)
             .map_err(|_| "DAVE frame encryption failed")?;
         if video {
-            let limit = rtp::MTU - 54;
+            let limit = pacer::MAX_PAYLOAD;
             let payloads = match frame.codec {
                 Codec::H265 => h265::payloads(data, limit)?,
                 Codec::Av1 => av1::payloads(data, frame.keyframe, limit)?,
@@ -913,12 +714,25 @@ impl<'a> Call<'a> {
         if data.len() > rtp::MTU - 32 {
             return Err("Opus frame exceeds transport MTU".into());
         }
-        let octets = data.len();
         // Audio never waits behind the video pacer or its repair budget.
-        let sender = &self.audio_sender;
-        let header = rtp::header(sender.sequence, timestamp, ssrc, sender.packets == 0);
-        seal_and_send(self.cipher.as_mut(), self.udp.as_ref(), &header, &[data]).await?;
-        self.audio_sender.sent(Some(timestamp), octets);
+        let sender = &mut self.audio_sender;
+        let header = rtp::header(
+            sender.sequence,
+            timestamp,
+            ssrc,
+            sender.packets == 0,
+            rtp::OPUS_PT,
+        );
+        sender.sent(Some(timestamp), data.len());
+        let packet = self
+            .cipher
+            .as_mut()
+            .ok_or("Transport key missing")?
+            .seal(&header, &[data])?;
+        let udp = self.udp.as_ref().ok_or("UDP missing")?;
+        udp.send(packet)
+            .await
+            .map_err(|_| "Voice UDP send failed")?;
         Ok(())
     }
 
@@ -935,6 +749,9 @@ impl<'a> Call<'a> {
             }
             return Ok(());
         }
+        let Mode::Voice { output, .. } = &self.mode else {
+            return Ok(());
+        };
         let Some(clear) = rtp::clear_len(packet) else {
             return Ok(());
         };
@@ -942,49 +759,32 @@ impl<'a> Call<'a> {
             return Ok(());
         };
         let (header, plain) = packet.split_at(clear);
-        if matches!(packet[1] & 127, rtp::H264_PT | rtp::H264_RTX_PT) {
-            if let Some(media) = rtp::media(header, plain) {
-                let repair = packet[1] & 127 == rtp::H264_RTX_PT;
-                if let Some(camera) = self.cameras.iter().find_map(|(ssrc, camera)| {
-                    ((*ssrc == media.ssrc && !repair) || (camera.rtx == media.ssrc && repair))
-                        .then_some(camera)
-                }) {
-                    camera.push(media, repair);
-                }
-            }
+        let Some(payload) = rtp::opus(header, plain) else {
             return Ok(());
-        }
-        match self.mode {
-            Mode::GoLive { .. } => Ok(()),
-            Mode::Voice { ref output, .. } => {
-                let Some(packet) = rtp::opus(header, plain) else {
-                    return Ok(());
-                };
-                let Some(user) = self.ssrc_users.get(&packet.ssrc) else {
-                    return Ok(());
-                };
-                let Some(decryptor) = self.mls.as_mut().and_then(|m| m.decryptors.get_mut(user))
-                else {
-                    return Ok(());
-                };
-                let Ok(data) = decryptor.decrypt(Codec::Opus, packet.payload) else {
-                    return Ok(());
-                };
-                // Playback is polled alongside transport and can drain a full queue
-                // once this send yields.
-                output
-                    .send(ReceivedFrame {
-                        marker: packet.marker,
-                        ssrc: packet.ssrc,
-                        sequence: packet.sequence,
-                        user: user.parse().unwrap_or_default(),
-                        timestamp: packet.timestamp,
-                        data,
-                    })
-                    .await
-                    .map_err(|_| "Playback queue closed".into())
-            }
-        }
+        };
+        let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+        let Some(user) = self.ssrc_users.get(&ssrc) else {
+            return Ok(());
+        };
+        let Some(decryptor) = self.mls.as_mut().and_then(|m| m.decryptors.get_mut(user)) else {
+            return Ok(());
+        };
+        // Playback receives a plain RTP header without extensions or padding.
+        let mut rtp_header: [u8; 12] = header[..12].try_into().unwrap();
+        rtp_header[0] = 0x80;
+        let Ok(packet) = decryptor.decrypt(Codec::Opus, payload, &rtp_header) else {
+            return Ok(());
+        };
+        // Playback is polled alongside transport and can drain a full queue once this send yields.
+        let frame = ReceivedFrame {
+            user: user.parse().unwrap_or_default(),
+            ssrc,
+            packet,
+        };
+        output
+            .send(frame)
+            .await
+            .map_err(|_| "Playback queue closed".into())
     }
 
     async fn on_discovery(&mut self, packet: &[u8]) -> Result<(), String> {
@@ -1008,28 +808,25 @@ impl<'a> Call<'a> {
             return Err("Invalid UDP discovery port".into());
         }
         let mut codecs =
-            vec![json!({"name":"opus","type":"audio","priority":1000,"payload_type":120})];
-        if self.mode.video() {
-            let encode: &[Codec] = match &self.mode {
-                Mode::GoLive { codecs, .. } => codecs,
-                _ => &[],
-            };
-            // Discord prefers lower priorities.
-            for (index, codec) in [Codec::Av1, Codec::H265, Codec::H264]
-                .into_iter()
-                .filter(|codec| *codec == Codec::H264 || encode.contains(codec))
-                .enumerate()
-            {
-                let (media, rtx) = rtp::payload_types(codec);
-                codecs.push(json!({"name":codec_name(codec),"type":"video","priority":(index + 1) * 1000,"payload_type":media,"rtx_payload_type":rtx,"encode":encode.contains(&codec),"decode":codec == Codec::H264}));
-            }
-        } else {
-            codecs.push(json!({"name":"H264","type":"video","priority":1000,"payload_type":101,"rtx_payload_type":102,"encode":false,"decode":true}));
+            vec![json!({"name":"opus","type":"audio","priority":1000,"payload_type":rtp::OPUS_PT})];
+        let encode: &[Codec] = match &self.mode {
+            Mode::GoLive { codecs, .. } => codecs,
+            Mode::Voice { .. } => &[],
+        };
+        // Discord prefers lower priorities. Voice only offers decoding H.264.
+        for (index, codec) in [Codec::Av1, Codec::H265, Codec::H264]
+            .into_iter()
+            .filter(|codec| *codec == Codec::H264 || encode.contains(codec))
+            .enumerate()
+        {
+            let (media, rtx) = rtp::payload_types(codec);
+            codecs.push(json!({"name":codec_name(codec),"type":"video","priority":(index + 1) * 1000,"payload_type":media,"rtx_payload_type":rtx,"encode":encode.contains(&codec),"decode":codec == Codec::H264}));
         }
+        let data = json!({"address":address.to_string(),"port":port,"mode":rtp::MODE});
         event(
             &mut self.ws,
             1,
-            json!({"protocol":"udp","data":{"address":address.to_string(),"port":port,"mode":rtp::MODE},"codecs":codecs}),
+            json!({"protocol":"udp","data":data,"codecs":codecs}),
         )
         .await?;
         self.discovered = true;
@@ -1043,26 +840,18 @@ impl<'a> Call<'a> {
         let Some(feedback) = rtp::feedback(rtcp, video) else {
             return Ok(());
         };
-        if feedback.keyframe
-            && !self.need_keyframe
-            && !self
-                .pacing
-                .as_ref()
-                .is_some_and(|(pacer, _)| pacer.has_keyframe(std::time::Instant::now()))
-        {
-            // Repeated PLIs must not discard the keyframe already in flight or its repairs.
-            self.request_keyframe()?;
-        }
         let now = std::time::Instant::now();
         let (pacer, rate) = self.pacing.as_mut().ok_or("Video pacer missing")?;
-        pacer.request(&feedback.nacks, now);
-        let mut changed = feedback
+        // Repeated PLIs must not discard the keyframe already in flight or its repairs.
+        let resend = feedback.keyframe && !self.need_keyframe && !pacer.has_keyframe(now);
+        rate.lost(pacer.request(&feedback.nacks, now));
+        let changed = feedback
             .receiver_bitrate
             .and_then(|bitrate| rate.receiver(bitrate, now));
-        for report in &feedback.transport {
-            changed = rate.feedback(report, now).or(changed);
-        }
         self.set_bitrate(changed);
+        if resend {
+            self.request_keyframe()?;
+        }
         Ok(())
     }
 
@@ -1072,18 +861,15 @@ impl<'a> Call<'a> {
         else {
             return Ok(());
         };
-        let settings = *settings;
-        let key = video.to_string();
-        let Some(quality) = d[&key].as_u64().or_else(|| d["any"].as_u64()) else {
+        let maximum = settings.bitrate;
+        let Some(quality) = d[&video.to_string()].as_u64().or_else(|| d["any"].as_u64()) else {
             return Ok(());
         };
         let paused = quality == 0;
         if paused != self.paused {
             self.paused = paused;
             if paused {
-                if let Some((pacer, _)) = &mut self.pacing {
-                    pacer.clear(std::time::Instant::now());
-                }
+                self.clear_video();
             } else {
                 self.request_keyframe()?;
             }
@@ -1093,12 +879,12 @@ impl<'a> Call<'a> {
             return Ok(());
         }
         // Rendered pixel counts guide layer selection, not bitrate for our fixed-size layer.
-        let share = quality.min(100) as f64 / 100.0;
-        let cap = f64::from(settings.bitrate) * share;
+        let cap = (f64::from(maximum) * quality.min(100) as f64 / 100.0) as u32;
+        let now = std::time::Instant::now();
         let changed = self
             .pacing
             .as_mut()
-            .and_then(|(_, rate)| rate.set_cap(cap as u32, std::time::Instant::now()));
+            .and_then(|(_, rate)| rate.set_cap(cap, now));
         self.set_bitrate(changed);
         Ok(())
     }
@@ -1129,14 +915,14 @@ impl<'a> Call<'a> {
             self.seq_ack = i64::try_from(seq).map_err(|_| "Invalid voice sequence")?;
         }
         let d = &payload["d"];
-        match number(&payload, "op")? {
+        match int::<u64>(&payload, "op")? {
             8 => {
                 if self.heartbeat.is_some() {
                     return Err("Duplicate voice Hello".into());
                 }
                 let interval = d["heartbeat_interval"]
                     .as_f64()
-                    .filter(|v| v.is_finite() && *v >= 100.0 && *v <= 120_000.0)
+                    .filter(|v| (100.0..=120_000.0).contains(v))
                     .ok_or("Invalid voice heartbeat interval")?;
                 self.heartbeat = Some(Duration::from_secs_f64(interval / 1000.0));
                 self.next_heartbeat = Instant::now();
@@ -1151,13 +937,11 @@ impl<'a> Call<'a> {
                     self.report();
                 }
             }
-            14 => {
-                if self.mode.video() {
-                    if d["video_codec"].is_string() {
-                        self.select_codec(d["video_codec"].as_str())?;
-                    }
-                    self.request_keyframe()?;
+            14 if self.pacing.is_some() => {
+                if d["video_codec"].is_string() {
+                    self.select_codec(d["video_codec"].as_str())?;
                 }
+                self.request_keyframe()?;
             }
             2 => self.on_ready(d).await?,
             4 => self.on_session(d).await?,
@@ -1180,9 +964,7 @@ impl<'a> Call<'a> {
                 }
                 self.users.remove(&user);
                 self.ssrc_users.retain(|_, u| *u != user);
-                self.stop_camera(&user).await?;
             }
-            12 if matches!(self.mode, Mode::Voice { .. }) => self.camera_streams(d).await?,
             15 => self.on_sink_wants(d)?,
             5 => {
                 let user = id(&d["user_id"])?;
@@ -1190,11 +972,8 @@ impl<'a> Call<'a> {
                     return Err("Unrecognized speaking user".into());
                 }
                 let remote = int(d, "ssrc")?;
-                if remote == self.ssrc {
-                    return Err("Conflicting voice SSRC".into());
-                }
                 self.ssrc_users.retain(|_, u| *u != user);
-                if self.ssrc_users.get(&remote).is_some_and(|u| *u != user) {
+                if remote == self.ssrc || self.ssrc_users.contains_key(&remote) {
                     return Err("Conflicting voice SSRC".into());
                 }
                 self.ssrc_users.insert(remote, user);
@@ -1222,7 +1001,7 @@ impl<'a> Call<'a> {
             24 => {
                 self.mls.as_ref().ok_or("DAVE epoch before session")?;
                 let version = version(d, "protocol_version", self.max_version)?;
-                if number(d, "epoch")? != 1 {
+                if int::<u64>(d, "epoch")? != 1 {
                     return Err("DAVE version migration unsupported".into());
                 }
                 self.new_key_package(version).await?;
@@ -1236,19 +1015,15 @@ impl<'a> Call<'a> {
         if self.udp.is_some() {
             return Err("Duplicate voice Ready".into());
         }
-        if !d["modes"]
-            .as_array()
-            .ok_or("Missing transport modes")?
-            .iter()
-            .any(|m| m.as_str() == Some(rtp::MODE))
-        {
+        let modes = d["modes"].as_array().ok_or("Missing transport modes")?;
+        if !modes.iter().any(|m| m.as_str() == Some(rtp::MODE)) {
             return Err("AES256-GCM rtpsize unavailable".into());
         }
         self.ssrc = int(d, "ssrc")?;
         if self.ssrc == 0 {
             return Err("Invalid local SSRC".into());
         }
-        if self.mode.video() {
+        if self.pacing.is_some() {
             let streams = d["streams"]
                 .as_array()
                 .filter(|streams| streams.len() <= 8)
@@ -1260,8 +1035,7 @@ impl<'a> Call<'a> {
             if allocated.next().is_some() {
                 return Err("Duplicate allocated screen RID".into());
             }
-            let video = int(stream, "ssrc")?;
-            let rtx = int(stream, "rtx_ssrc")?;
+            let (video, rtx) = (int(stream, "ssrc")?, int(stream, "rtx_ssrc")?);
             if video == 0 || rtx == 0 || video == rtx || video == self.ssrc || rtx == self.ssrc {
                 return Err("Invalid allocated video SSRCs".into());
             }
@@ -1269,14 +1043,14 @@ impl<'a> Call<'a> {
         }
         let ip = d["ip"]
             .as_str()
-            .ok_or("Missing voice UDP address")?
-            .parse::<IpAddr>()
-            .map_err(|_| "Invalid voice UDP address")?;
+            .and_then(|ip| ip.parse::<IpAddr>().ok())
+            .ok_or("Invalid voice UDP address")?;
         let port = int(d, "port")?;
         if port == 0 || ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
             return Err("Invalid voice UDP peer".into());
         }
-        let socket = UdpSocket::bind(if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
+        let local = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let socket = UdpSocket::bind(local)
             .await
             .map_err(|_| "Voice UDP bind failed")?;
         socket
@@ -1303,20 +1077,16 @@ impl<'a> Call<'a> {
         {
             return Err("Unsupported negotiated voice mode or codec".into());
         }
-        if self.mode.video() {
-            self.select_codec(d["video_codec"].as_str())?;
-        }
+        self.select_codec(d["video_codec"].as_str())?;
         let key = d["secret_key"]
             .as_array()
             .filter(|a| a.len() == 32)
-            .ok_or("Invalid transport key")?
-            .iter()
-            .map(|v| {
-                v.as_u64()
-                    .and_then(|n| u8::try_from(n).ok())
-                    .ok_or("Invalid transport key")
+            .and_then(|key| {
+                key.iter()
+                    .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+                    .collect::<Option<Vec<_>>>()
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .ok_or("Invalid transport key")?;
         self.cipher = Some(rtp::Cipher::new(&key)?);
         if let Mode::GoLive { settings, .. } = &self.mode {
             let capture::VideoSettings {
@@ -1356,24 +1126,6 @@ impl<'a> Call<'a> {
         binary(&mut self.ws, 26, package).await
     }
 
-    /// Invalidates a transition and restarts from a fresh key package.
-    async fn recover(&mut self, transition: Option<u16>) -> Result<(), String> {
-        if self.recoveries >= 3 {
-            return Err("MLS recovery budget exhausted".into());
-        }
-        self.recoveries += 1;
-        if let Some(transition) = transition {
-            event(&mut self.ws, 31, json!({"transition_id":transition})).await?;
-        }
-        let version = self
-            .mls
-            .as_ref()
-            .ok_or("DAVE missing")?
-            .session
-            .protocol_version();
-        self.new_key_package(version).await
-    }
-
     async fn begin_transition(&mut self, transition: u16) -> Result<(), String> {
         let mls = self.mls.as_mut().ok_or("DAVE missing")?;
         mls.pending = Some((transition, Instant::now()));
@@ -1407,19 +1159,18 @@ impl<'a> Call<'a> {
     }
 
     async fn on_mls(&mut self, op: u8, data: &[u8]) -> Result<(), String> {
-        let mls = self.mls.as_ref().ok_or("MLS message before session")?;
+        let recognized: Vec<_> = self.users.iter().map(String::as_str).collect();
+        let mls = self.mls.as_mut().ok_or("MLS message before session")?;
         if !mls.external {
             return Err("MLS message before external sender".into());
         }
-        let recognized: Vec<_> = self.users.iter().map(String::as_str).collect();
-        let mls = self.mls.as_mut().ok_or("MLS message before session")?;
         if op == 27 {
             // MLS state advances on commit, independently of the pending media-key switch.
-            if let Some(commit) = mls
+            let commit = mls
                 .session
                 .process_proposals(data, &recognized)
-                .map_err(|_| "MLS proposals rejected")?
-            {
+                .map_err(|_| "MLS proposals rejected")?;
+            if let Some(commit) = commit {
                 binary(&mut self.ws, 28, commit).await?;
             }
             return Ok(());
@@ -1430,30 +1181,29 @@ impl<'a> Call<'a> {
         let transition = u16::from_be_bytes([data[0], data[1]]);
         let result = if op == 29 {
             match mls.session.process_commit(&data[2..]) {
-                Ok(Some(roster)) => Ok((roster, false)),
                 Ok(None) => return Ok(()),
-                Err(()) => Err(()),
+                result => result.map(|roster| (roster.unwrap(), false)),
             }
         } else {
             mls.session
                 .process_welcome(&data[2..], &recognized)
-                .map(|r| (r, true))
+                .map(|roster| (roster, true))
         };
         let Ok((roster, full)) = result else {
             event(&mut self.ws, 31, json!({"transition_id":transition})).await?;
-            self.recover(None).await?;
+            if self.recoveries >= 3 {
+                return Err("MLS recovery budget exhausted".into());
+            }
+            self.recoveries += 1;
+            let version = mls.session.protocol_version();
+            self.new_key_package(version).await?;
             self.dave_ready = false;
             self.report();
             self.startup = Instant::now() + DEADLINE;
             return Ok(());
         };
-        mls.roster(
-            roster,
-            full,
-            &self.users,
-            &self.user_id,
-            matches!(self.mode, Mode::Voice { .. }),
-        )?;
+        let receiving = matches!(self.mode, Mode::Voice { .. });
+        mls.roster(roster, full, &self.users, &self.user_id, receiving)?;
         self.begin_transition(transition).await
     }
 

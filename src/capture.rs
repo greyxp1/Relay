@@ -1,37 +1,19 @@
 pub use gst::ClockTime;
 use gstreamer::{self as gst, prelude::*};
-use gstreamer_app::AppSink;
+use gstreamer_app::{AppSink, AppSinkCallbacks};
 use std::{
     collections::VecDeque,
+    ffi::{c_char, c_void, CString},
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
 use tokio::sync::mpsc;
 
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicU64;
-
-#[cfg(target_os = "linux")]
-mod audio;
-#[cfg(target_os = "windows")]
-mod windows;
-
-#[cfg(target_os = "windows")]
-const AUDIO_PROVIDER: &str = "wasapi2deviceprovider";
-#[cfg(target_os = "linux")]
-const AUDIO_PROVIDER: &str = "pulsedeviceprovider";
-#[cfg(target_os = "windows")]
-const AUDIO_SOURCE: &str = "wasapi2src";
-#[cfg(target_os = "linux")]
-const AUDIO_SOURCE: &str = "pulsesrc";
-
 const AUDIO_BITRATE: u32 = 128_000;
 pub(crate) const VIDEO_MIN_BITRATE: u32 = 100_000;
 pub(crate) const VIDEO_START_BITRATE: u32 = 2_500_000;
-/// Discord negotiates constrained-baseline H.264 for browser viewers.
-const H264_PROFILE: &str = "constrained-baseline";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -52,68 +34,34 @@ impl Codec {
             _ => 90_000,
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VideoEncoder {
-    X264,
-    Nvenc,
-}
-
-impl VideoEncoder {
-    pub fn available(self, codec: Codec) -> Result<bool, String> {
-        gst::init().map_err(|e| e.to_string())?;
-        Ok(self
-            .element(codec)
-            .is_some_and(|name| gst::ElementFactory::find(name).is_some()))
+    fn encoder(self) -> &'static str {
+        match self {
+            Self::H265 => "nvh265enc",
+            Self::Av1 => "nvav1enc",
+            _ => "nvh264enc",
+        }
     }
 
     /// Video codecs this machine encodes, most efficient first.
     /// NVENC elements register only for codecs the GPU supports.
-    pub fn codecs(self) -> Result<Vec<Codec>, String> {
-        let mut codecs = Vec::new();
-        for codec in [Codec::Av1, Codec::H265, Codec::H264] {
-            if self.available(codec)? {
-                codecs.push(codec);
-            }
-        }
-        Ok(codecs)
+    pub fn available() -> Result<Vec<Self>, String> {
+        gst::init().map_err(|e| e.to_string())?;
+        let codecs = [Self::Av1, Self::H265, Self::H264];
+        Ok(codecs
+            .into_iter()
+            .filter(|c| gst::ElementFactory::find(c.encoder()).is_some())
+            .collect())
     }
+}
 
-    /// The encoder's bitrate property units. GStreamer's NVENC kbit is 1024 bits.
-    fn kbits(self, bitrate: u32) -> u32 {
-        match self {
-            Self::X264 => bitrate / 1000,
-            Self::Nvenc => bitrate / 1024,
-        }
-    }
-
-    fn element(self, codec: Codec) -> Option<&'static str> {
-        match (self, codec) {
-            (Self::X264, Codec::H264) => Some("x264enc"),
-            (Self::Nvenc, Codec::H264) => Some(if cfg!(target_os = "windows") {
-                "nvd3d11h264enc"
-            } else {
-                "nvh264enc"
-            }),
-            (Self::Nvenc, Codec::H265) => Some(if cfg!(target_os = "windows") {
-                "nvd3d11h265enc"
-            } else {
-                "nvh265enc"
-            }),
-            (Self::Nvenc, Codec::Av1) => Some(if cfg!(target_os = "windows") {
-                "nvd3d11av1enc"
-            } else {
-                "nvav1enc"
-            }),
-            _ => None,
-        }
-    }
+/// NVENC bitrate properties count kbit as 1024 bits.
+fn kbits(bitrate: u32) -> u32 {
+    bitrate / 1024
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct VideoSettings {
-    pub encoder: VideoEncoder,
     pub codec: Codec,
     pub width: u32,
     pub height: u32,
@@ -131,10 +79,10 @@ pub struct ScreenSettings {
 
 impl ScreenSettings {
     pub fn validate(self) -> Result<Self, String> {
-        if (self.height != 0 && !(16..=2160).contains(&self.height))
+        if (self.height != 0 && !(128..=2160).contains(&self.height))
             || !(1..=240).contains(&self.fps)
         {
-            return Err("Select source resolution or 16–2160p, and 1–240 fps".into());
+            return Err("Select source resolution or 128–2160p, and 1–240 fps".into());
         }
         Ok(self)
     }
@@ -142,21 +90,16 @@ impl ScreenSettings {
 
 impl VideoSettings {
     pub fn validate(self) -> Result<Self, String> {
-        if !(16..=3840).contains(&self.width)
+        if !(192..=3840).contains(&self.width)
             || !self.width.is_multiple_of(2)
-            || !(16..=2160).contains(&self.height)
+            || !(128..=2160).contains(&self.height)
             || !self.height.is_multiple_of(2)
             || !(1..=240).contains(&self.fps)
             || !(VIDEO_MIN_BITRATE..=50_000_000).contains(&self.bitrate)
             || !self.bitrate.is_multiple_of(1000)
+            || self.codec == Codec::Opus
         {
-            return Err("Video requires even dimensions from 16×16 to 3840×2160, 1–240 fps, and 100000–50000000 bit/s in steps of 1000".into());
-        }
-        if self.encoder.element(self.codec).is_none() {
-            return Err(format!("{:?} cannot encode {:?}", self.encoder, self.codec));
-        }
-        if self.encoder == VideoEncoder::Nvenc && (self.width < 192 || self.height < 128) {
-            return Err("NVENC requires dimensions of at least 192×128".into());
+            return Err("NVENC video requires even dimensions from 192×128 to 3840×2160, 1–240 fps, and 100000–50000000 bit/s in steps of 1000".into());
         }
         Ok(self)
     }
@@ -169,22 +112,39 @@ pub struct Frame {
     pub keyframe: bool,
 }
 
-struct AudioSource {
-    id: String,
-    name: String,
-    monitor: bool,
+unsafe extern "C" {
+    fn relay_share_audio_open(name: *const c_char, result: *mut *mut c_void) -> i32;
+    fn relay_share_audio_error(router: *mut c_void) -> i32;
+    fn relay_share_audio_free(router: *mut c_void);
 }
 
-#[derive(Clone)]
-enum VideoSource {
-    Screen(String),
-    Device(gst::Device),
+/// Routes other applications' audio into a private sink, without call playback.
+struct ShareAudio(*mut c_void);
+
+// All graph access is protected by PipeWire's thread loop lock, including destruction.
+unsafe impl Send for ShareAudio {}
+
+impl Drop for ShareAudio {
+    fn drop(&mut self) {
+        unsafe { relay_share_audio_free(self.0) }
+    }
 }
 
-#[derive(serde::Serialize)]
-pub struct VideoDevice {
-    pub id: String,
-    pub name: String,
+struct Portal {
+    session: Option<ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>>,
+    _remote: Option<std::os::fd::OwnedFd>,
+}
+
+impl Drop for Portal {
+    fn drop(&mut self) {
+        if let (Some(session), Ok(runtime)) =
+            (self.session.take(), tokio::runtime::Handle::try_current())
+        {
+            runtime.spawn(async move {
+                let _ = session.close().await;
+            });
+        }
+    }
 }
 
 /// Owns the pipeline and its callbacks. Dropping it stops capture synchronously.
@@ -195,432 +155,202 @@ pub struct Capture {
     /// Loudest audio sample since the caller last reset it.
     pub peak: Arc<AtomicU16>,
     /// Source and settings that rebuild video in another codec.
-    video: Option<(VideoSource, VideoSettings)>,
-    portal: Option<Portal>,
-    #[cfg(target_os = "linux")]
-    audio: Option<audio::ShareAudio>,
+    video: Option<(String, VideoSettings)>,
+    _portal: Option<Portal>,
+    audio: Option<ShareAudio>,
 }
 
-#[cfg(target_os = "linux")]
-struct Portal {
-    session: Option<ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>>,
-    _remote: Option<std::os::fd::OwnedFd>,
+fn launch(description: &str) -> Result<gst::Pipeline, String> {
+    gst::parse::launch(description)
+        .map_err(|e| e.to_string())?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "Invalid media pipeline".into())
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for Portal {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = session.close().await;
-                });
-            }
+fn audio_pipeline(device: &str) -> Result<gst::Pipeline, String> {
+    let pipeline = launch(&format!(
+        "pulsesrc name=input ! audioconvert ! volume name=audio_volume ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! opusenc name=encoder bitrate={AUDIO_BITRATE} audio-type=generic frame-size=20 ! appsink name=encoded sync=false max-buffers=2 drop=true"
+    ))?;
+    let input = pipeline.by_name("input").ok_or("Missing audio source")?;
+    input.set_property("device", (!device.is_empty()).then_some(device));
+    Ok(pipeline)
+}
+
+/// GStreamer video from `source`, scaled on the GPU and encoded by NVENC.
+fn video_pipeline(source: &str, settings: VideoSettings) -> Result<gst::Pipeline, String> {
+    let VideoSettings {
+        codec,
+        width,
+        height,
+        fps,
+        bitrate,
+    } = settings.validate()?;
+    gst::init().map_err(|e| e.to_string())?;
+    let vbv = kbits(bitrate.min(VIDEO_START_BITRATE)) / 4;
+    // P4 gains about 0.4 dB over P1, but H.265 P4 tops out near 4K60 on one shared NVENC engine.
+    let quality_limit = if codec == Codec::H264 { 144 } else { 120 };
+    let pixels = u64::from(width) * u64::from(height) * u64::from(fps);
+    let preset = if pixels > 2560 * 1440 * quality_limit {
+        "p1"
+    } else {
+        "p4"
+    };
+    let output = match codec {
+        // Discord negotiates constrained-baseline H.264 for browser viewers.
+        Codec::H264 => {
+            "video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
         }
-    }
-}
-
-#[cfg(target_os = "windows")]
-struct Portal;
-
-#[cfg(target_os = "windows")]
-pub struct ScreenSource {
-    pub id: String,
-    pub name: String,
-    pub width: i32,
-    pub height: i32,
-    pub rate: i32,
+        Codec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au,profile=main",
+        _ => "video/x-av1,stream-format=obu-stream,alignment=tu",
+    };
+    let headers = if codec == Codec::Av1 {
+        ""
+    } else {
+        " repeat-sequence-header=true"
+    };
+    // Avoid periodic keyframes, whose bursts can overwhelm a limited send rate.
+    // Bound the rate buffer to the startup budget to keep keyframes small after bandwidth falls.
+    // Frames stay on the GPU from the DMA-BUF to NVENC. Rendering NV12 hands NVENC a PBO it can map.
+    // The default GL shader scales without locking later size queries into passthrough.
+    launch(&format!(
+        "{source} ! videorate drop-only=true skip-to-first=true ! capsfilter name=video_rate caps=\"video/x-raw(ANY),framerate={fps}/1\" ! glupload ! glcolorconvert ! glshader ! video/x-raw(memory:GLMemory),width={width},height={height},pixel-aspect-ratio=1/1 ! glcolorconvert ! video/x-raw(memory:GLMemory),format=NV12 ! {} name=video_encoder preset={preset} tune=ultra-low-latency rc-mode=cbr bitrate={} vbv-buffer-size={vbv} spatial-aq=true gop-size=-1 bframes=0 rc-lookahead=0 zerolatency=true{headers} ! {output} ! appsink name=encoded sync=false max-buffers=2",
+        codec.encoder(),
+        kbits(bitrate),
+    ))
 }
 
 impl Capture {
-    pub fn screen_sources() -> Vec<VideoDevice> {
-        #[cfg(target_os = "windows")]
-        {
-            windows::screens()
-                .into_iter()
-                .map(|source| VideoDevice {
-                    id: source.id,
-                    name: source.name,
-                })
-                .collect()
-        }
-        #[cfg(target_os = "linux")]
-        {
-            Vec::new()
-        }
-    }
-
-    pub fn is_screen_source(source: &str) -> bool {
-        cfg!(target_os = "windows")
-            && (source.starts_with("monitor:") || source.starts_with("window:"))
-    }
-
-    fn cameras() -> Result<Vec<(VideoDevice, gst::Device)>, String> {
-        gst::init().map_err(|e| e.to_string())?;
-        let monitor = gst::DeviceMonitor::new();
-        monitor.add_filter(Some("Video/Source"), None);
-        monitor.start().map_err(|e| e.to_string())?;
-        let devices = monitor
-            .devices()
-            .into_iter()
-            .map(|device| {
-                let name = device.display_name().to_string();
-                let id = device
-                    .properties()
-                    .and_then(|properties| properties.get::<String>("device.path").ok())
-                    .unwrap_or_else(|| name.clone());
-                (VideoDevice { id, name }, device)
-            })
-            .collect();
-        monitor.stop();
-        Ok(devices)
-    }
-
-    pub fn video_devices() -> Result<Vec<VideoDevice>, String> {
-        Ok(Self::cameras()?.into_iter().map(|(info, _)| info).collect())
-    }
-
-    pub fn camera(
-        selected: &str,
-        encoder: VideoEncoder,
-        codec: Codec,
-        quality: ScreenSettings,
-    ) -> Result<(Self, mpsc::Receiver<Frame>, VideoSettings), String> {
-        let mut devices = Self::cameras()?
-            .into_iter()
-            .filter(|(info, _)| info.id == selected);
-        let (_, device) = devices
-            .next()
-            .ok_or("The selected camera or capture card is unavailable")?;
-        if devices.next().is_some() {
-            return Err("The selected video device is ambiguous".into());
-        }
-        let source = VideoSource::Device(device);
-        let pipeline = Self::video_pipeline(
-            &source,
-            "videoconvert ! appsink name=size sync=false max-buffers=1 drop=true",
-        )?;
-        let dimensions = Self::dimensions(pipeline, |caps| {
-            caps.get::<gst::Fraction>("framerate")
-                .ok()
-                .filter(|rate| rate.numer() > 0)
-                .map_or(30, |rate| {
-                    (f64::from(rate.numer()) / f64::from(rate.denom())).ceil() as i32
-                })
-        });
-        Self::screen_capture(source, encoder, codec, dimensions?, quality, None)
-    }
-
-    fn dimensions(
-        pipeline: gst::Pipeline,
-        rate: impl FnOnce(&gst::StructureRef) -> i32,
-    ) -> Result<(i32, i32, i32), String> {
-        let result = (|| {
-            let sink = pipeline
-                .by_name("size")
-                .ok_or("Missing capture probe")?
-                .downcast::<AppSink>()
-                .map_err(|_| "Invalid capture probe")?;
-            pipeline
-                .set_state(gst::State::Playing)
-                .map_err(|e| e.to_string())?;
-            let sample = sink
-                .try_pull_sample(gst::ClockTime::from_seconds(5))
-                .ok_or("Could not read capture dimensions")?;
-            let caps = sample
-                .caps()
-                .and_then(|caps| caps.structure(0))
-                .ok_or("Missing capture dimensions")?;
-            Ok((
-                caps.get::<i32>("width")
-                    .map_err(|_| "Missing capture width")?,
-                caps.get::<i32>("height")
-                    .map_err(|_| "Missing capture height")?,
-                rate(caps),
-            ))
-        })();
-        let _ = pipeline.set_state(gst::State::Null);
-        result
-    }
-
-    fn video_pipeline(source: &VideoSource, tail: &str) -> Result<gst::Pipeline, String> {
-        let description = match source {
-            VideoSource::Screen(description) => description.as_str(),
-            VideoSource::Device(_) => "identity name=video_source ! decodebin",
-        };
-        let pipeline = gst::parse::launch(&format!("{description} ! {tail}"))
-            .map_err(|e| e.to_string())?
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| "Invalid video pipeline")?;
-        if let VideoSource::Device(device) = source {
-            let input = device.create_element(None).map_err(|e| e.to_string())?;
-            pipeline.add(&input).map_err(|e| e.to_string())?;
-            input
-                .link(
-                    &pipeline
-                        .by_name("video_source")
-                        .ok_or("Missing video source")?,
-                )
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(pipeline)
-    }
-
+    /// The PulseAudio name of a device chosen by ID or by a unique display name.
     pub fn audio_device(selected: &str, outputs: bool) -> Result<String, String> {
-        let devices = Self::audio_devices(outputs)?;
-        if let Some(device) = devices.iter().find(|device| device.id == selected) {
-            return Ok(device.id.clone());
+        gst::init().map_err(|e| e.to_string())?;
+        let provider = gst::DeviceProviderFactory::by_name("pulsedeviceprovider")
+            .ok_or("Audio device provider unavailable")?;
+        provider.start().map_err(|e| e.to_string())?;
+        let class = if outputs {
+            "Audio/Sink"
+        } else {
+            "Audio/Source"
+        };
+        let devices: Vec<_> = provider
+            .devices()
+            .iter()
+            .filter(|device| device.device_class() == class)
+            .map(|device| {
+                let monitor = device
+                    .properties()
+                    .and_then(|p| p.get::<String>("device.class").ok())
+                    .is_some_and(|class| class == "monitor");
+                (
+                    device.property::<String>("internal-name"),
+                    device.display_name().to_string(),
+                    monitor,
+                )
+            })
+            .filter(|(id, ..)| !id.starts_with("relay-share-"))
+            .collect();
+        provider.stop();
+        if let Some((id, ..)) = devices.iter().find(|(id, ..)| id == selected) {
+            return Ok(id.clone());
         }
         let mut matches = devices
-            .iter()
-            .filter(|device| device.name == selected && !device.monitor);
-        let device = matches
+            .into_iter()
+            .filter(|(_, name, monitor)| name == selected && !monitor);
+        let (id, ..) = matches
             .next()
             .ok_or("Discord's selected audio device is unavailable")?;
         if matches.next().is_some() {
             return Err("Discord's selected audio device name is ambiguous".into());
         }
-        Ok(device.id.clone())
-    }
-
-    fn audio_devices(outputs: bool) -> Result<Vec<AudioSource>, String> {
-        gst::init().map_err(|e| e.to_string())?;
-        let provider = gst::DeviceProviderFactory::by_name(AUDIO_PROVIDER)
-            .ok_or("Audio device provider unavailable")?;
-        provider.start().map_err(|e| e.to_string())?;
-        let sources = provider
-            .devices()
-            .iter()
-            .filter(|device| {
-                device.device_class()
-                    == if outputs {
-                        "Audio/Sink"
-                    } else {
-                        "Audio/Source"
-                    }
-            })
-            .map(|device| {
-                let properties = device.properties();
-                #[cfg(target_os = "windows")]
-                let monitor = properties
-                    .as_ref()
-                    .and_then(|p| p.get::<bool>("wasapi2.device.loopback").ok())
-                    .unwrap_or(false);
-                #[cfg(target_os = "windows")]
-                let id = format!(
-                    "{}{}",
-                    if monitor { "loopback:" } else { "" },
-                    device.property::<String>("device")
-                );
-                #[cfg(target_os = "linux")]
-                let id = device.property::<String>("internal-name");
-                AudioSource {
-                    id,
-                    name: device.display_name().to_string(),
-                    #[cfg(target_os = "windows")]
-                    monitor,
-                    #[cfg(target_os = "linux")]
-                    monitor: properties
-                        .as_ref()
-                        .and_then(|p| p.get::<String>("device.class").ok())
-                        .is_some_and(|class| class == "monitor"),
-                }
-            })
-            .filter(|device| !device.id.starts_with("relay-share-"))
-            .collect();
-        provider.stop();
-        Ok(sources)
+        Ok(id)
     }
 
     /// Encodes stereo without adding speech processing or changing system devices.
     /// An empty device selects the system default. `peak` tracks speaking activity.
     pub fn audio(device: &str) -> Result<(Self, mpsc::Receiver<Frame>), String> {
         gst::init().map_err(|e| e.to_string())?;
-        let pipeline = Self::audio_pipeline(&format!("{AUDIO_SOURCE} name=input"))?;
-        let input = pipeline.by_name("input").ok_or("Missing audio source")?;
-        #[cfg(target_os = "windows")]
-        let device = if let Some(id) = device.strip_prefix("loopback:") {
-            input.set_property("loopback", true);
-            id
-        } else {
-            device
-        };
-        input.set_property("device", (!device.is_empty()).then_some(device));
-        Self::encode_audio(pipeline, true)
-    }
-
-    fn audio_pipeline(source: &str) -> Result<gst::Pipeline, String> {
-        gst::parse::launch(&format!(
-            "{source} ! audioconvert ! volume name=audio_volume ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! opusenc name=encoder bitrate={AUDIO_BITRATE} audio-type=generic frame-size=20 ! appsink name=encoded sync=false max-buffers=2 drop=true"
-        )).map_err(|e| e.to_string())?.downcast::<gst::Pipeline>().map_err(|_| "Invalid audio pipeline".into())
+        let pipeline = audio_pipeline(device)?;
+        let peak = Arc::new(AtomicU16::new(0));
+        let level = peak.clone();
+        pipeline
+            .by_name("encoder")
+            .and_then(|encoder| encoder.static_pad("sink"))
+            .ok_or("Missing audio encoder")?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                    let samples = map.as_chunks::<2>().0.iter();
+                    let loudest = samples.map(|s| i16::from_le_bytes(*s).unsigned_abs()).max();
+                    level.fetch_max(loudest.unwrap_or(0), Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        let (mut capture, frames) = Self::start(pipeline, Codec::Opus, None)?;
+        capture.peak = peak;
+        Ok((capture, frames))
     }
 
     pub fn set_audio_volume(&self, volume: f64) -> Result<(), String> {
         if !volume.is_finite() || !(0.0..=10.0).contains(&volume) {
             return Err("Invalid microphone volume".into());
         }
-        self.pipeline
+        let element = self
+            .pipeline
             .by_name("audio_volume")
-            .ok_or("Microphone volume missing")?
-            .set_property("volume", volume);
+            .ok_or("Microphone volume missing")?;
+        element.set_property("volume", volume);
         Ok(())
     }
 
+    /// Captures other applications' audio, excluding call playback.
     pub async fn share_audio() -> Result<(Self, mpsc::Receiver<Frame>), String> {
         gst::init().map_err(|e| e.to_string())?;
-        #[cfg(target_os = "linux")]
-        {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let name = format!(
-                "relay-share-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            );
-            let target = name.clone();
-            let router = tokio::task::spawn_blocking(move || audio::ShareAudio::open(&target))
-                .await
-                .map_err(|_| "Audio isolation stopped")??;
-            let pipeline = Self::audio_pipeline(&format!("{AUDIO_SOURCE} name=input"))?;
-            pipeline
-                .by_name("input")
-                .unwrap()
-                .set_property("device", format!("{name}.monitor"));
-            let (mut capture, frames) = Self::encode_audio(pipeline, false)?;
-            capture.audio = Some(router);
-            Ok((capture, frames))
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let pipeline = Self::audio_pipeline(&format!("{AUDIO_SOURCE} name=input"))?;
-            let input = pipeline.by_name("input").unwrap();
-            if input.find_property("loopback-target-pid").is_none() {
-                return Err(
-                    "This Windows version cannot exclude call audio from screen sharing".into(),
-                );
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "relay-share-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let target = CString::new(name.clone()).map_err(|e| e.to_string())?;
+        let router = tokio::task::spawn_blocking(move || {
+            let mut router = std::ptr::null_mut();
+            match unsafe { relay_share_audio_open(target.as_ptr(), &mut router) } {
+                result if result < 0 => Err(format!(
+                    "Could not isolate share audio: {}",
+                    std::io::Error::from_raw_os_error(-result)
+                )),
+                _ => Ok(ShareAudio(router)),
             }
-            input.set_property("loopback", true);
-            input.set_property_from_str("loopback-mode", "exclude-process-tree");
-            input.set_property("loopback-target-pid", std::process::id());
-            Self::encode_audio(pipeline, false)
-        }
-    }
-
-    fn encode_audio(
-        pipeline: gst::Pipeline,
-        metered: bool,
-    ) -> Result<(Self, mpsc::Receiver<Frame>), String> {
-        let peak = Arc::new(AtomicU16::new(0));
-        let level = peak.clone();
-        if metered {
-            pipeline
-                .by_name("encoder")
-                .and_then(|encoder| encoder.static_pad("sink"))
-                .ok_or("Missing audio encoder")?
-                .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-                    if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
-                        let loudest = map
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|s| i16::from_le_bytes(*s).unsigned_abs())
-                            .max()
-                            .unwrap_or(0);
-                        level.fetch_max(loudest, Ordering::Relaxed);
-                    }
-                    gst::PadProbeReturn::Ok
-                });
-        }
-        let (mut capture, frames) = Self::start(pipeline, Codec::Opus, None)?;
-        capture.peak = peak;
+        })
+        .await
+        .map_err(|_| "Audio isolation stopped")??;
+        let (mut capture, frames) = Self::start(
+            audio_pipeline(&format!("{name}.monitor"))?,
+            Codec::Opus,
+            None,
+        )?;
+        capture.audio = Some(router);
         Ok((capture, frames))
     }
 
-    fn video(source: &VideoSource, settings: VideoSettings) -> Result<gst::Pipeline, String> {
-        let VideoSettings {
-            encoder,
-            codec,
-            width,
-            height,
-            fps,
-            bitrate,
-        } = settings.validate()?;
-        gst::init().map_err(|e| e.to_string())?;
-        let vbv = encoder.kbits(bitrate.min(VIDEO_START_BITRATE)) / 4;
-        let bitrate = encoder.kbits(bitrate);
-        // P4 gains about 0.4 dB over P1, but H.265 P4 tops out near 4K60 on one shared NVENC engine.
-        let quality_limit = if codec == Codec::H264 { 144 } else { 120 };
-        let preset = if u64::from(width) * u64::from(height) * u64::from(fps)
-            > 2560 * 1440 * quality_limit
-        {
-            "p1"
-        } else {
-            "p4"
-        };
-        let element = encoder.element(codec).unwrap();
-        // Avoid periodic keyframes, whose bursts can overwhelm a limited send rate.
-        // Bound the rate buffer to the startup budget to keep keyframes small after bandwidth falls.
-        // Frames stay on the GPU from the DMA-BUF to NVENC. Rendering NV12 hands NVENC a PBO it can map.
-        // The default GL shader scales without locking later size queries into passthrough.
-        let (scale, encoder) = match encoder {
-            VideoEncoder::X264 => (if cfg!(target_os = "windows") && matches!(source, VideoSource::Screen(_)) { "d3d11download ! videoconvert ! videoscale ! video/x-raw" } else { "videoconvert ! videoscale ! video/x-raw" }, format!("x264enc name=video_encoder tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max=1073741824 vbv-buf-capacity=250 byte-stream=true")),
-            VideoEncoder::Nvenc => {
-                #[cfg(target_os = "linux")]
-                let (scale, convert) = ("glupload ! glcolorconvert ! glshader ! video/x-raw(memory:GLMemory)", "glcolorconvert ! video/x-raw(memory:GLMemory),format=NV12 ! ");
-                #[cfg(target_os = "windows")]
-                let (scale, convert) = ("d3d11convert ! video/x-raw(memory:D3D11Memory)", "");
-                (scale, format!("{convert}{element} name=video_encoder preset={preset} tune=ultra-low-latency rc-mode=cbr bitrate={bitrate} vbv-buffer-size={vbv} spatial-aq=true gop-size=-1 bframes=0 rc-lookahead=0 zerolatency=true{}", if codec == Codec::Av1 { "" } else { " repeat-sequence-header=true" }))
-            },
-        };
-        let output = match codec {
-            Codec::H264 => format!(
-                "video/x-h264,stream-format=byte-stream,alignment=au,profile={H264_PROFILE}"
-            ),
-            Codec::H265 => {
-                "video/x-h265,stream-format=byte-stream,alignment=au,profile=main".into()
-            }
-            Codec::Av1 => "video/x-av1,stream-format=obu-stream,alignment=tu".into(),
-            Codec::Opus => unreachable!("validated video codec"),
-        };
-        #[cfg(target_os = "windows")]
-        let scale = if matches!(source, VideoSource::Device(_))
-            && settings.encoder == VideoEncoder::Nvenc
-        {
-            format!("d3d11upload ! {scale}")
-        } else {
-            scale.to_owned()
-        };
-        Self::video_pipeline(source, &format!(
-            "videorate drop-only=true skip-to-first=true ! capsfilter name=video_rate caps=\"video/x-raw(ANY),framerate={fps}/1\" ! {scale},width={width},height={height},pixel-aspect-ratio=1/1 ! {encoder} ! {output} ! appsink name=encoded sync=false max-buffers=2"
-        ))
-    }
-
     /// Select one source through the portal. Nothing is saved for later capture.
-    #[cfg(target_os = "linux")]
     pub async fn screen(
-        encoder: VideoEncoder,
         codec: Codec,
-        selected: Option<&str>,
         quality: ScreenSettings,
     ) -> Result<(Self, mpsc::Receiver<Frame>, VideoSettings), String> {
-        if selected.is_some() {
-            return Err("Choose the screen through the capture portal".into());
-        }
         use ashpd::desktop::screencast::{
             CursorMode, Screencast, SelectSourcesOptions, SourceType,
         };
         use std::os::fd::AsRawFd;
+        let quality = quality.validate()?;
         gst::init().map_err(|e| e.to_string())?;
-        let element = encoder
-            .element(codec)
-            .ok_or_else(|| format!("{encoder:?} cannot encode {codec:?}"))?;
-        let scale: &[_] = match encoder {
-            VideoEncoder::X264 => &["videoconvert", "videoscale"],
-            VideoEncoder::Nvenc => &["glupload", "glcolorconvert", "glshader"],
-        };
-        for &name in [&["pipewiresrc", element][..], scale].concat().iter() {
-            if gst::ElementFactory::find(name).is_none() {
-                return Err(format!("Missing native media plugin: {name}"));
-            }
+        for name in [
+            "pipewiresrc",
+            codec.encoder(),
+            "glupload",
+            "glcolorconvert",
+            "glshader",
+        ] {
+            gst::ElementFactory::find(name)
+                .ok_or_else(|| format!("Missing native media plugin: {name}"))?;
         }
         let portal = Screencast::new().await.map_err(|e| e.to_string())?;
         // Finish creation so a cancelled request still closes its returned session.
@@ -640,22 +370,18 @@ impl Capture {
         .await
         .map_err(|_| "Screen session creation stopped")??;
         let session = owner.session.as_ref().unwrap();
-        portal
-            .select_sources(
-                session,
-                SelectSourcesOptions::default()
-                    .set_cursor_mode(CursorMode::Embedded)
-                    .set_sources(SourceType::Monitor | SourceType::Window)
-                    .set_multiple(false)
-                    .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
-            )
-            .await
+        let options = SelectSourcesOptions::default()
+            .set_cursor_mode(CursorMode::Embedded)
+            .set_sources(SourceType::Monitor | SourceType::Window)
+            .set_multiple(false)
+            .set_persist_mode(ashpd::desktop::PersistMode::DoNot);
+        let selected = portal.select_sources(session, options).await;
+        selected
             .map_err(|e| e.to_string())?
             .response()
             .map_err(|e| e.to_string())?;
-        let response = portal
-            .start(session, None, Default::default())
-            .await
+        let started = portal.start(session, None, Default::default()).await;
+        let response = started
             .map_err(|e| e.to_string())?
             .response()
             .map_err(|e| e.to_string())?;
@@ -674,146 +400,84 @@ impl Capture {
             "pipewiresrc fd={} path={node} provide-clock=false do-timestamp=true",
             remote.as_raw_fd()
         );
-        let probe_source = source.clone();
+        let probe = format!(
+            "{source} ! video/x-raw ! appsink name=size sync=false max-buffers=1 drop=true"
+        );
         let (width, height, rate, remote) = tokio::task::spawn_blocking(move || {
-            let pipeline = gst::parse::launch(&format!(
-                "{probe_source} ! video/x-raw ! appsink name=size sync=false max-buffers=1 drop=true"
-            ))
-            .map_err(|e| e.to_string())?
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| "Invalid capture probe")?;
-            let result = Self::dimensions(pipeline, |caps| {
+            let pipeline = launch(&probe)?;
+            let result = (|| {
+                let sink = pipeline
+                    .by_name("size")
+                    .and_then(|s| s.downcast::<AppSink>().ok());
+                pipeline
+                    .set_state(gst::State::Playing)
+                    .map_err(|e| e.to_string())?;
+                let sample = sink
+                    .and_then(|sink| sink.try_pull_sample(gst::ClockTime::from_seconds(5)))
+                    .ok_or("Could not read capture dimensions")?;
+                let caps = sample
+                    .caps()
+                    .and_then(|caps| caps.structure(0))
+                    .ok_or("Missing capture dimensions")?;
                 // Rounding up a fractional maximum can request an unsupported PipeWire format.
-                ["framerate", "max-framerate"].into_iter()
+                let rate = ["framerate", "max-framerate"]
+                    .into_iter()
                     .filter_map(|name| caps.get::<gst::Fraction>(name).ok())
                     .find(|rate| rate.numer() > 0)
-                    .map(|rate| rate.numer() / rate.denom())
-                    .unwrap_or(60)
-            });
+                    .map_or(60, |rate| rate.numer() / rate.denom());
+                let dimension = |name| {
+                    caps.get::<i32>(name)
+                        .map_err(|_| "Missing capture dimensions")
+                };
+                Ok::<_, String>((dimension("width")?, dimension("height")?, rate))
+            })();
+            let _ = pipeline.set_state(gst::State::Null);
             // Cancellation cannot close the FD while this blocking probe still uses it.
             result.map(|(width, height, rate)| (width, height, rate, remote))
         })
         .await
         .map_err(|_| "Screen size inspection stopped")??;
         owner._remote = Some(remote);
-        Self::screen_capture(
-            VideoSource::Screen(source),
-            encoder,
-            codec,
-            (width, height, rate),
-            quality,
-            Some(owner),
-        )
-    }
-
-    #[cfg(target_os = "windows")]
-    pub async fn screen(
-        encoder: VideoEncoder,
-        codec: Codec,
-        selected: Option<&str>,
-        quality: ScreenSettings,
-    ) -> Result<(Self, mpsc::Receiver<Frame>, VideoSettings), String> {
-        let selected = selected.ok_or("Select a screen or window")?.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let source = windows::screens()
-                .into_iter()
-                .find(|source| source.id == selected)
-                .ok_or("The selected screen or window is no longer available")?;
-            let (kind, handle) = source.id.split_once(':').ok_or("Invalid capture source")?;
-            let handle = handle
-                .parse::<u64>()
-                .map_err(|_| "Invalid capture source")?;
-            let source_pipeline = format!(
-                "d3d11screencapturesrc capture-api=wgc {kind}-handle={handle} show-cursor=true"
-            );
-            Self::screen_capture(
-                VideoSource::Screen(source_pipeline),
-                encoder,
-                codec,
-                (source.width, source.height, source.rate),
-                quality,
-                None,
-            )
-        })
-        .await
-        .map_err(|_| "Screen setup failed")?
-    }
-
-    fn screen_capture(
-        source: VideoSource,
-        encoder: VideoEncoder,
-        codec: Codec,
-        dimensions: (i32, i32, i32),
-        quality: ScreenSettings,
-        portal: Option<Portal>,
-    ) -> Result<(Self, mpsc::Receiver<Frame>, VideoSettings), String> {
-        let quality = quality.validate()?;
-        let (width, height, rate) = dimensions;
-        if width < 16 || height < 16 {
-            return Err("The selected surface is too small to share".into());
-        }
-        let scale = (3840.0 / f64::from(width))
-            .min(
-                f64::from(if quality.height == 0 {
-                    2160
-                } else {
-                    quality.height
-                }) / f64::from(height),
-            )
-            .min(1.0);
-        let width = ((f64::from(width) * scale) as u32 / 2 * 2).max(16);
-        let height = ((f64::from(height) * scale) as u32 / 2 * 2).max(16);
-        let encoder = if encoder == VideoEncoder::Nvenc && (width < 192 || height < 128) {
-            VideoEncoder::X264
+        let (width, height) = (f64::from(width.max(1)), f64::from(height.max(1)));
+        let limit = if quality.height == 0 {
+            2160
         } else {
-            encoder
+            quality.height
         };
+        let scale = (3840.0 / width).min(f64::from(limit) / height).min(1.0);
+        let even = |size: f64| (size * scale) as u32 / 2 * 2;
+        let (width, height) = (even(width), even(height));
         let fps = quality.fps.min(rate.clamp(1, 240) as u32);
         // H.265 and AV1 reach H.264's quality with about a third less bitrate.
         let bits_per_pixel = if codec == Codec::H264 { 0.15 } else { 0.1 };
+        let bitrate = (f64::from(width * height * fps) * bits_per_pixel) as u32 / 1000 * 1000;
+        let bitrate = bitrate.clamp(4_000_000, 50_000_000);
         let settings = VideoSettings {
-            encoder,
             codec,
             width,
             height,
             fps,
-            bitrate: ((f64::from(width * height * fps) * bits_per_pixel) as u32 / 1000 * 1000)
-                .clamp(4_000_000, 50_000_000),
+            bitrate,
         }
         .validate()?;
         // The source paces frames at their damage times, up to the chosen rate, without duplicates.
         // The last frame repeats after a quiet quarter second so keyframe requests on a static screen still complete.
-        #[cfg(target_os = "linux")]
-        let source = match source {
-            VideoSource::Screen(source) => VideoSource::Screen(format!(
-                "{source} keepalive-time=250 ! video/x-raw(ANY),max-framerate={fps}/1"
-            )),
-            device => device,
-        };
-        #[cfg(target_os = "windows")]
-        let source = match source {
-            VideoSource::Screen(source) => VideoSource::Screen(format!(
-                "{source} ! video/x-raw(memory:D3D11Memory),framerate={fps}/1"
-            )),
-            device => device,
-        };
+        let source =
+            format!("{source} keepalive-time=250 ! video/x-raw(ANY),max-framerate={fps}/1");
         let initial = VideoSettings {
-            bitrate: settings.bitrate.min(VIDEO_START_BITRATE),
+            bitrate: bitrate.min(VIDEO_START_BITRATE),
             ..settings
         };
-        let (mut capture, frames) = Self::start(
-            Self::video(&source, initial)?,
-            codec,
-            Some((source, initial)),
-        )?;
-        capture.portal = portal;
+        let pipeline = video_pipeline(&source, initial)?;
+        let (mut capture, frames) = Self::start(pipeline, codec, Some((source, initial)))?;
+        capture._portal = Some(owner);
         Ok((capture, frames, settings))
     }
 
     fn start(
         pipeline: gst::Pipeline,
         codec: Codec,
-        video: Option<(VideoSource, VideoSettings)>,
+        video: Option<(String, VideoSettings)>,
     ) -> Result<(Self, mpsc::Receiver<Frame>), String> {
         let (sender, receiver) = mpsc::channel(4);
         let mut capture = Self {
@@ -822,8 +486,7 @@ impl Capture {
             sender,
             peak: Arc::default(),
             video,
-            portal: None,
-            #[cfg(target_os = "linux")]
+            _portal: None,
             audio: None,
         };
         capture.listen(codec)?;
@@ -831,10 +494,8 @@ impl Capture {
     }
 
     fn sink(pipeline: &gst::Pipeline) -> Result<AppSink, String> {
-        pipeline
-            .by_name("encoded")
-            .ok_or("Missing encoded sink")?
-            .downcast::<AppSink>()
+        let sink = pipeline.by_name("encoded").ok_or("Missing encoded sink")?;
+        sink.downcast::<AppSink>()
             .map_err(|_| "Invalid encoded sink".into())
     }
 
@@ -842,65 +503,59 @@ impl Capture {
         let sender = self.sender.clone();
         let pending = Arc::new(Mutex::new(VecDeque::<mpsc::OwnedPermit<Frame>>::new()));
         if codec != Codec::Opus {
-            let pending = pending.clone();
-            let sender = sender.clone();
+            let (pending, sender) = (pending.clone(), sender.clone());
             self.pipeline
                 .by_name("video_rate")
                 .and_then(|rate| rate.static_pad("src"))
                 .ok_or("Missing video rate pad")?
                 .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-                    let mut pending = pending.lock().unwrap();
                     // Reserve before encoding. Losing an encoded frame would break later references.
-                    let Ok(permit) = sender.clone().try_reserve_owned() else {
-                        return gst::PadProbeReturn::Drop;
-                    };
-                    pending.push_back(permit);
-                    gst::PadProbeReturn::Ok
+                    match sender.clone().try_reserve_owned() {
+                        Ok(permit) => {
+                            pending.lock().unwrap().push_back(permit);
+                            gst::PadProbeReturn::Ok
+                        }
+                        Err(_) => gst::PadProbeReturn::Drop,
+                    }
                 });
         }
-        self.sink.set_callbacks(
-            gstreamer_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                    let permit = if codec != Codec::Opus {
-                        pending
-                            .lock()
-                            .unwrap()
-                            .pop_front()
-                            .ok_or(gst::FlowError::Error)?
-                    } else {
-                        match sender.clone().try_reserve_owned() {
-                            Ok(permit) => permit,
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                return Ok(gst::FlowSuccess::Ok)
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                return Err(gst::FlowError::Eos)
-                            }
-                        }
-                    };
-                    // Encoders offset PTS (often by 1000 hours). The segment maps it
-                    // back to the shared running time, including after a codec switch.
-                    let pts = sample
-                        .segment()
-                        .and_then(|segment| segment.downcast_ref::<gst::ClockTime>())
-                        .and_then(|segment| segment.to_running_time(buffer.pts()?))
-                        .ok_or(gst::FlowError::Error)?;
-                    let frame = Frame {
-                        codec,
-                        pts,
-                        data: buffer
-                            .to_owned()
-                            .into_mapped_buffer_readable()
-                            .map_err(|_| gst::FlowError::Error)?,
-                        keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
-                    };
-                    permit.send(frame);
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
+        let callbacks = AppSinkCallbacks::builder().new_sample(move |sink| {
+            let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+            let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+            let permit = if codec != Codec::Opus {
+                pending
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or(gst::FlowError::Error)?
+            } else {
+                match sender.clone().try_reserve_owned() {
+                    Ok(permit) => permit,
+                    Err(mpsc::error::TrySendError::Full(_)) => return Ok(gst::FlowSuccess::Ok),
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Err(gst::FlowError::Eos),
+                }
+            };
+            // Encoders offset PTS (often by 1000 hours). The segment maps it
+            // back to the shared running time, including after a codec switch.
+            let pts = sample
+                .segment()
+                .and_then(|segment| segment.downcast_ref::<gst::ClockTime>())
+                .and_then(|segment| segment.to_running_time(buffer.pts()?))
+                .ok_or(gst::FlowError::Error)?;
+            let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+            let data = buffer
+                .to_owned()
+                .into_mapped_buffer_readable()
+                .map_err(|_| gst::FlowError::Error)?;
+            permit.send(Frame {
+                codec,
+                pts,
+                data,
+                keyframe,
+            });
+            Ok(gst::FlowSuccess::Ok)
+        });
+        self.sink.set_callbacks(callbacks.build());
         self.pipeline.set_state(gst::State::Playing).map_err(|_| {
             self.error()
                 .unwrap_or_else(|| "Could not start native capture".into())
@@ -915,8 +570,8 @@ impl Capture {
         if settings.codec == codec {
             return Ok(());
         }
-        let settings = VideoSettings { codec, ..settings }.validate()?;
-        let pipeline = Self::video(&source, settings)?;
+        let settings = VideoSettings { codec, ..settings };
+        let pipeline = video_pipeline(&source, settings)?;
         let sink = Self::sink(&pipeline)?;
         // RTP keeps its timeline across codec changes. Do not restart source timestamps.
         pipeline.use_clock(self.pipeline.clock().as_ref());
@@ -924,8 +579,7 @@ impl Capture {
         pipeline.set_base_time(self.pipeline.base_time().ok_or("Capture clock missing")?);
         // Stop the old source before reconnecting capture.
         let _ = self.pipeline.set_state(gst::State::Null);
-        self.sink
-            .set_callbacks(gstreamer_app::AppSinkCallbacks::builder().build());
+        self.sink.set_callbacks(AppSinkCallbacks::builder().build());
         self.pipeline = pipeline;
         self.sink = sink;
         self.video = Some((source, settings));
@@ -933,12 +587,16 @@ impl Capture {
     }
 
     pub fn error(&self) -> Option<String> {
-        #[cfg(target_os = "linux")]
-        if let Some(error) = self.audio.as_ref().and_then(audio::ShareAudio::error) {
-            return Some(error);
+        if let Some(audio) = &self.audio {
+            let error = unsafe { relay_share_audio_error(audio.0) };
+            if error != 0 {
+                return Some(std::io::Error::from_raw_os_error(error).to_string());
+            }
         }
-        let bus = self.pipeline.bus()?;
-        let message = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])?;
+        let message = self
+            .pipeline
+            .bus()?
+            .pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])?;
         Some(match message.view() {
             gst::MessageView::Error(error) => error.error().to_string(),
             _ => "Capture ended".into(),
@@ -947,15 +605,19 @@ impl Capture {
 
     /// Updates rate control without resetting the encoder's reference chain.
     pub fn set_video_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
-        if !(VIDEO_MIN_BITRATE..=50_000_000).contains(&bitrate) || !bitrate.is_multiple_of(1000) {
-            return Err("Invalid video bitrate".into());
-        }
         let (_, settings) = self.video.as_mut().ok_or("Capture has no video")?;
-        self.pipeline
+        let updated = VideoSettings {
+            bitrate,
+            ..*settings
+        }
+        .validate()
+        .map_err(|_| "Invalid video bitrate")?;
+        let encoder = self
+            .pipeline
             .by_name("video_encoder")
-            .ok_or("Video encoder missing")?
-            .set_property("bitrate", settings.encoder.kbits(bitrate));
-        settings.bitrate = bitrate;
+            .ok_or("Video encoder missing")?;
+        encoder.set_property("bitrate", kbits(bitrate));
+        *settings = updated;
         Ok(())
     }
 
@@ -974,7 +636,6 @@ impl Drop for Capture {
     fn drop(&mut self) {
         // NULL waits for streaming tasks before releasing the callback's channel sender.
         let _ = self.pipeline.set_state(gst::State::Null);
-        self.sink
-            .set_callbacks(gstreamer_app::AppSinkCallbacks::builder().build());
+        self.sink.set_callbacks(AppSinkCallbacks::builder().build());
     }
 }

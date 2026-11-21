@@ -20,16 +20,11 @@ libloading = "0.8"
 aes-gcm = "0.10"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = "thin"

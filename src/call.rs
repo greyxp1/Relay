@@ -1,16 +1,16 @@
 use crate::WebSocket;
 use crate::{
-    capture::{Capture, ClockTime, Codec, Frame, ScreenSettings, VideoEncoder, VideoSettings},
+    capture::{Capture, ClockTime, Codec, Frame, ScreenSettings, VideoSettings},
     dave::Identity,
     playback::Playback,
     transport::{self, Credentials, Mode},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, watch},
     task::JoinHandle,
     time::{self, Instant},
 };
@@ -32,6 +32,16 @@ struct Voice {
     users: HashMap<u64, f64>,
 }
 
+impl Voice {
+    fn speaker_volume(&self) -> f64 {
+        if self.deaf {
+            0.0
+        } else {
+            self.output_volume
+        }
+    }
+}
+
 fn user_volumes<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<HashMap<u64, f64>, D::Error> {
@@ -40,6 +50,14 @@ fn user_volumes<'de, D: serde::Deserializer<'de>>(
         .into_iter()
         .map(|(user, volume)| Ok((user.parse().map_err(serde::de::Error::custom)?, volume)))
         .collect()
+}
+
+fn text(value: Value) -> Message {
+    Message::Text(value.to_string().into())
+}
+
+fn device_error(output: &mpsc::Sender<Message>, error: String) {
+    let _ = output.try_send(text(json!({"op":"deviceError", "error":error})));
 }
 
 fn microphone(
@@ -53,7 +71,10 @@ fn microphone(
         .and_then(|device| Capture::audio(&device))
         .or_else(|error| {
             let capture = Capture::audio("")?;
-            let _ = output.try_send(Message::Text(json!({"op":"deviceError", "error":format!("{error}. Using the system default microphone.")}).to_string().into()));
+            device_error(
+                output,
+                format!("{error}. Using the system default microphone."),
+            );
             Ok(capture)
         })
 }
@@ -61,7 +82,6 @@ fn microphone(
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum Command {
-    VideoDevices,
     Connect {
         id: String,
         user: String,
@@ -90,7 +110,6 @@ enum Command {
     },
     PrepareShare {
         id: String,
-        source: Option<String>,
         #[serde(flatten)]
         quality: ScreenSettings,
         audio: bool,
@@ -107,7 +126,6 @@ struct Call {
     voice: watch::Sender<Voice>,
     keyframe: watch::Sender<()>,
     capture: Option<mpsc::Sender<CaptureChange>>,
-    source: Option<String>,
 }
 impl Drop for Call {
     fn drop(&mut self) {
@@ -116,7 +134,6 @@ impl Drop for Call {
 }
 
 struct Prepared {
-    source: Option<String>,
     capture: Capture,
     frames: mpsc::Receiver<Frame>,
     video: VideoSettings,
@@ -127,42 +144,16 @@ struct Prepared {
 
 enum CaptureChange {
     Prepared(Prepared),
-    Camera {
-        source: String,
-        quality: ScreenSettings,
-        audio: bool,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
     Reconnect {
         endpoint: String,
         token: Zeroizing<String>,
     },
 }
 
-async fn prepare(
-    quality: ScreenSettings,
-    audio: bool,
-    source: Option<String>,
-) -> Result<Prepared, String> {
-    let quality = quality.validate()?;
-    let encoder = if VideoEncoder::Nvenc.available(Codec::H264)? {
-        VideoEncoder::Nvenc
-    } else {
-        VideoEncoder::X264
-    };
-    let camera = source
-        .as_ref()
-        .filter(|source| !Capture::is_screen_source(source));
-    let (capture, frames, video) = if let Some(source) = camera.cloned() {
-        tokio::task::spawn_blocking(move || Capture::camera(&source, encoder, Codec::H264, quality))
-            .await
-            .map_err(|_| "Video device setup failed")??
-    } else {
-        Capture::screen(encoder, Codec::H264, source.as_deref(), quality).await?
-    };
-    let codecs = video.encoder.codecs()?;
+async fn prepare(quality: ScreenSettings, audio: bool) -> Result<Prepared, String> {
+    let (capture, frames, video) = Capture::screen(Codec::H264, quality).await?;
+    let codecs = Codec::available()?;
     Ok(Prepared {
-        source,
         capture,
         frames,
         video,
@@ -172,19 +163,9 @@ async fn prepare(
     })
 }
 
-type Picker = (
-    String,
-    Option<String>,
-    JoinHandle<Result<Option<Prepared>, String>>,
-);
+type Picker = (String, Option<String>, JoinHandle<Result<Prepared, String>>);
 
-struct Controls {
-    voice: watch::Receiver<Voice>,
-    keyframe: watch::Sender<()>,
-    capture: mpsc::Receiver<CaptureChange>,
-}
-
-async fn preparing(task: &mut Option<Picker>) -> Result<Option<Prepared>, String> {
+async fn preparing(task: &mut Option<Picker>) -> Result<Prepared, String> {
     match task {
         Some((_, _, task)) => task.await.map_err(|_| "Screen picker stopped".to_owned())?,
         None => std::future::pending().await,
@@ -215,65 +196,53 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
         mpsc::channel::<(String, Option<Prepared>, Option<String>)>(16);
     let mut calls = HashMap::<String, Call>::new();
     let mut identity: Option<(String, Zeroizing<String>, Identity)> = None;
-    let mut prepared = None;
-    let mut picker = None;
+    let mut prepared: Option<Prepared> = None;
+    let mut picker: Option<Picker> = None;
     let result = async {
         send(&mut sending, Message::Text("{}".into())).await?;
         let mut tick = time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
                 message = incoming.next() => match message {
-                    Some(Ok(Message::Text(text))) => {
-                        let command: Command = serde_json::from_str(&text).map_err(|_| "Invalid media command")?;
-                        match command {
-                            Command::VideoDevices => {
-                                let (devices, screens) = tokio::task::spawn_blocking(|| (Capture::video_devices(), Capture::screen_sources()))
-                                    .await.map_err(|_| "Video device discovery failed")?;
-                                let response = match devices {
-                                    Ok(devices) => json!({"op":"videoDevices", "devices":devices, "screens":screens}),
-                                    Err(error) => json!({"op":"videoDevices", "error":error, "screens":screens}),
-                                };
-                                send(&mut sending, Message::Text(response.to_string().into())).await?;
-                            }
+                    Some(Ok(Message::Text(message))) => {
+                        match serde_json::from_str(&message).map_err(|_| "Invalid media command")? {
                             Command::Connect { id, user, session, server, channel, token, endpoint, sending: streaming, voice } => {
                                 if id.is_empty() || id.len() > 64 || calls.contains_key(&id) || calls.len() >= 16 {
                                     return Err("Invalid media connection".into());
                                 }
-                                if let Some((expected_user, expected_session, _)) = &identity {
-                                    if &user != expected_user || &session != expected_session { return Err("Account or session changed".into()); }
-                                } else {
-                                    identity = Some((user.clone(), session.clone(), Identity::new(&user)?));
+                                match &identity {
+                                    Some((known, known_session, _)) if (known, known_session) != (&user, &session) => {
+                                        return Err("Account or session changed".into());
+                                    }
+                                    Some(_) => {}
+                                    None => identity = Some((user.clone(), session.clone(), Identity::new(&user)?)),
                                 }
+                                let capture = match (streaming, prepared.take()) {
+                                    (false, kept) => { prepared = kept; None }
+                                    (true, Some(capture)) => Some(capture),
+                                    (true, None) => {
+                                        send(&mut sending, text(json!({"op":"ended", "id":id, "error":"Select a screen before streaming"}))).await?;
+                                        continue;
+                                    }
+                                };
                                 let credentials = Credentials {
                                     identity: identity.as_ref().unwrap().2.clone(),
                                     user_id: user, session_id: session, server_id: server, channel_id: channel, token, endpoint,
                                 };
-                                let (voice_control, settings) = watch::channel(voice);
+                                let (voice, settings) = watch::channel(voice);
                                 let (keyframe, _) = watch::channel(());
-                                let capture = if streaming {
-                                    match prepared.take() {
-                                        Some(capture) => Some(capture),
-                                        None => {
-                                            send(&mut sending, Message::Text(json!({"op":"ended", "id":id, "error":"Select a screen before streaming"}).to_string().into())).await?;
-                                            continue;
-                                        }
-                                    }
-                                } else { None };
-                                let source = capture.as_ref().and_then(|capture| capture.source.clone());
-                                let output = output.clone();
-                                let finished = finished.clone();
-                                let call_id = id.clone();
-                                let recovery = keyframe.clone();
                                 let (replacement, replacements) = mpsc::channel(1);
+                                let (output, finished, call_id, keyframes) = (output.clone(), finished.clone(), id.clone(), keyframe.clone());
                                 let task = tokio::task::spawn_local(async move {
-                                    let (result, recovered) = run(&call_id, credentials, capture, Controls { voice: settings, keyframe: recovery, capture: replacements }, &output).await;
+                                    let controls = Controls { voice: settings, keyframe: keyframes, capture: replacements };
+                                    let (result, recovered) = run(credentials, capture, controls, &call_id, &output).await;
                                     let error = result.err();
                                     if let Some(error) = &error {
                                         eprintln!("Call {call_id} ended: {error}");
                                     }
                                     let _ = finished.send((call_id, recovered, error)).await;
                                 });
-                                calls.insert(id, Call { task, voice: voice_control, keyframe, capture: streaming.then_some(replacement), source });
+                                calls.insert(id, Call { task, voice, keyframe, capture: streaming.then_some(replacement) });
                             }
                             Command::Stop { id } => { calls.remove(&id); }
                             Command::Reconnect { id, endpoint, token } => {
@@ -287,25 +256,10 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                             Command::Keyframe { id } => {
                                 if let Some(call) = calls.get(&id) { call.keyframe.send_replace(()); }
                             }
-                            Command::PrepareShare { id, source, quality, audio, replace } => {
+                            Command::PrepareShare { id, quality, audio, replace } => {
                                 if let Some((_, _, task)) = picker.take() { task.abort(); }
                                 prepared = None;
-                                let same_camera = source.as_ref().filter(|source| !Capture::is_screen_source(source)).and_then(|source| replace.as_ref()
-                                    .and_then(|id| calls.get(id)).filter(|call| call.source.as_ref() == Some(source))
-                                    .and_then(|call| call.capture.as_ref()));
-                                let task = if let Some(camera) = same_camera {
-                                    let camera = camera.clone();
-                                    tokio::task::spawn_local(async move {
-                                        let quality = quality.validate()?;
-                                        let (reply, response) = oneshot::channel();
-                                        camera.send(CaptureChange::Camera { source: source.unwrap(), quality, audio, reply }).await
-                                            .map_err(|_| "Stream controls unavailable")?;
-                                        response.await.map_err(|_| "Video device change stopped")?.map(|()| None)
-                                    })
-                                } else {
-                                    tokio::task::spawn_local(async move { prepare(quality, audio, source).await.map(Some) })
-                                };
-                                picker = Some((id, replace, task));
+                                picker = Some((id, replace, tokio::task::spawn_local(prepare(quality, audio))));
                             }
                             Command::CancelShare => {
                                 if let Some((_, _, task)) = picker.take() { task.abort(); }
@@ -318,59 +272,49 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                     Some(Err(_)) => break Err("Browser connection closed".into()),
                     _ => {},
                 },
-                Some(message) = outgoing.recv() => {
-                    send(&mut sending, message).await?;
-                }
+                Some(message) = outgoing.recv() => send(&mut sending, message).await?,
                 Some((id, recovered, error)) = completions.recv() => {
                     calls.remove(&id);
-                    let recoverable = if let Some(mut recovered) = recovered {
-                        if prepared.is_none() {
-                            recovered.expires = Instant::now() + Duration::from_secs(60);
-                            prepared = Some(recovered);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    send(&mut sending, Message::Text(json!({"op":"ended", "id":id, "error":error, "recoverable":recoverable}).to_string().into())).await?;
+                    let recoverable = recovered.is_some() && prepared.is_none();
+                    if let Some(mut recovered) = recovered.filter(|_| recoverable) {
+                        recovered.expires = Instant::now() + Duration::from_secs(60);
+                        prepared = Some(recovered);
+                    }
+                    send(&mut sending, text(json!({"op":"ended", "id":id, "error":error, "recoverable":recoverable}))).await?;
                 }
                 result = preparing(&mut picker) => {
                     let (id, replace, _) = picker.take().unwrap();
-                    let error = match result {
-                        Ok(None) => None,
-                        Ok(Some(value)) => if let Some(target) = replace {
-                            let source = value.source.clone();
-                            calls.get_mut(&target).and_then(|call| {
-                                call.capture.as_ref()?.try_send(CaptureChange::Prepared(value)).ok()?;
-                                call.source = source;
-                                Some(())
-                            }).is_none().then(|| "Stream ended before the source changed".to_owned())
-                        } else { prepared = Some(value); None },
-                        Err(e) => Some(e),
+                    let error = match (result, replace) {
+                        (Ok(value), Some(target)) => calls
+                            .get(&target)
+                            .and_then(|call| call.capture.as_ref()?.try_send(CaptureChange::Prepared(value)).ok())
+                            .is_none()
+                            .then(|| "Stream ended before the source changed".to_owned()),
+                        (Ok(value), None) => { prepared = Some(value); None }
+                        (Err(error), _) => Some(error),
                     };
-                    send(&mut sending, Message::Text(json!({"op":"prepared", "id":id, "error":error}).to_string().into())).await?;
+                    send(&mut sending, text(json!({"op":"prepared", "id":id, "error":error}))).await?;
                 }
-                frame = preview(&mut prepared) => {
-                    if let Some(frame) = frame {
-                        if let Some((user, _, _)) = &identity {
-                            let user = user.parse().map_err(|_| "Invalid user")?;
-                            let _ = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame)));
-                        }
-                    } else { prepared = None; }
-                }
+                frame = preview(&mut prepared) => match (frame, &identity) {
+                    (Some(frame), Some((user, _, _))) => {
+                        let user = user.parse().map_err(|_| "Invalid user")?;
+                        let _ = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame)));
+                    }
+                    (Some(_), None) => {}
+                    (None, _) => prepared = None,
+                },
                 _ = tick.tick() => {
                     let capture_error = prepared.as_ref().and_then(|p| p.capture.error()
                         .or_else(|| (p.expires <= Instant::now()).then(|| "Screen selection expired".into())));
                     if let Some(error) = capture_error {
                         prepared = None;
-                        let _ = output.try_send(Message::Text(json!({"op":"captureEnded", "error":error}).to_string().into()));
+                        let _ = output.try_send(text(json!({"op":"captureEnded", "error":error})));
                     }
                 }
             }
         }
-    }.await;
+    }
+    .await;
     if let Some((_, _, task)) = picker {
         task.abort();
     }
@@ -378,80 +322,74 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
     result
 }
 
+struct Controls {
+    voice: watch::Receiver<Voice>,
+    keyframe: watch::Sender<()>,
+    capture: mpsc::Receiver<CaptureChange>,
+}
+
+/// Runs media sessions until one ends, adopting replacement captures and
+/// endpoints without ending the Discord stream. A failed stream returns its
+/// capture when it can be reused.
 async fn run(
-    id: &str,
     mut credentials: Credentials,
     mut prepared: Option<Prepared>,
     mut controls: Controls,
+    id: &str,
     output: &mpsc::Sender<Message>,
 ) -> (Result<(), String>, Option<Prepared>) {
     let streaming = prepared.is_some();
     loop {
         let outcome = {
+            let voice = controls.voice.clone();
             let session = run_session(
                 id,
                 credentials.clone(),
                 &mut prepared,
-                controls.voice.clone(),
-                controls.keyframe.clone(),
+                voice,
+                &controls.keyframe,
                 output,
             );
-            tokio::pin!(session);
             tokio::select! {
-                result = &mut session => Ok(result),
-                replacement = controls.capture.recv(), if streaming => Err(replacement),
+                result = session => Ok(result),
+                change = controls.capture.recv(), if streaming => Err(change),
             }
         };
-        let next = match outcome {
+        let change = match outcome {
             Ok(result) => {
                 let recoverable = result.is_err()
-                    && prepared.as_ref().is_some_and(|p| p.capture.error().is_none())
+                    && prepared
+                        .as_ref()
+                        .is_some_and(|p| p.capture.error().is_none())
                     && !matches!(
                         result.as_ref().map_err(String::as_str),
                         Err("Capture ended" | "Browser connection closed")
                     );
-                return (result, if recoverable { prepared } else { None });
+                return (result, prepared.filter(|_| recoverable));
             }
-            Err(Some(change)) => change,
-            Err(None) => return (Err("Stream controls closed".into()), None),
+            Err(change) => change,
         };
-        if let CaptureChange::Reconnect { endpoint, token } = next {
-            credentials.endpoint = endpoint;
-            credentials.token = token;
-            continue;
+        match change {
+            None => return (Err("Stream controls closed".into()), None),
+            Some(CaptureChange::Reconnect { endpoint, token }) => {
+                credentials.endpoint = endpoint;
+                credentials.token = token;
+            }
+            // The Discord stream stays open while its media session adopts the new source and quality.
+            Some(CaptureChange::Prepared(next)) => {
+                let Ok(permit) = output.try_reserve() else {
+                    return (Err("Browser playback stalled".into()), None);
+                };
+                permit.send(packet(
+                    4,
+                    0,
+                    credentials.user_id.parse().unwrap_or_default(),
+                    0,
+                    &[],
+                ));
+                prepared = Some(next);
+            }
         }
-        // The Discord stream stays open while its media session adopts the new source and quality.
-        let user = match credentials.user_id.parse() {
-            Ok(user) => user,
-            Err(_) => return (Err("Invalid user".into()), None),
-        };
-        let Ok(permit) = output.try_reserve() else {
-            return (Err("Browser playback stalled".into()), None);
-        };
-        permit.send(packet(4, 0, user, 0, &[]));
-        prepared = Some(match next {
-            CaptureChange::Prepared(prepared) => prepared,
-            CaptureChange::Camera {
-                source,
-                quality,
-                audio,
-                reply,
-            } => {
-                // Cameras can be exclusive. The old session must release its device before reopening it.
-                drop(prepared.take());
-                match prepare(quality, audio, Some(source)).await {
-                    Ok(prepared) => {
-                        let _ = reply.send(Ok(()));
-                        prepared
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(error.clone()));
-                        return (Err(error), None);
-                    }
-                }
-            }
-            CaptureChange::Reconnect { .. } => unreachable!(),
-        });
     }
 }
 
@@ -460,70 +398,66 @@ async fn run_session(
     credentials: Credentials,
     prepared: &mut Option<Prepared>,
     mut settings: watch::Receiver<Voice>,
-    requests: watch::Sender<()>,
+    keyframe: &watch::Sender<()>,
     output: &mpsc::Sender<Message>,
 ) -> Result<(), String> {
     let (status_tx, mut status_rx) = watch::channel(transport::Status::default());
     let report = move |status| {
         status_tx.send_if_modified(|previous| std::mem::replace(previous, status) != status);
     };
-    let (received, mut frames) = mpsc::channel(16);
-    let (video, mut pictures) = mpsc::channel(4);
     let mut current = settings.borrow_and_update().clone();
-    let mut voice_capture = None;
-    let mut audio_capture = None;
-    let mut playback = None;
-    let initial_codec = prepared.as_ref().map_or(Codec::H264, |p| p.video.codec);
-    let (codec_tx, mut codec_rx) = watch::channel(initial_codec);
+    let (received, mut frames) = mpsc::channel(16);
+    let (codec_tx, mut codec_rx) =
+        watch::channel(prepared.as_ref().map_or(Codec::H264, |p| p.video.codec));
     let (keyframe_tx, mut keyframe_rx) = mpsc::channel(1);
     let (voice_tx, voice_rx) = watch::channel(!current.mute && !current.deaf);
     let (send, input) = mpsc::channel(4);
     let user: u64 = credentials.user_id.parse().map_err(|_| "Invalid user")?;
+    let mut voice_capture = None;
+    let mut audio_capture = None;
+    let mut playback = None;
     let mode = if let Some(p) = prepared.as_ref() {
-        let audio_input = if p.audio {
-            let (audio, input) = Capture::share_audio().await?;
-            audio_capture = Some(audio);
+        let audio = if p.audio {
+            let (capture, input) = Capture::share_audio().await?;
+            audio_capture = Some(capture);
             Some(input)
         } else {
             None
         };
+        let codecs = p.codecs.clone();
         Mode::GoLive {
             settings: p.video,
-            codecs: p.codecs.clone(),
+            codecs,
             codec: codec_tx,
             video: input,
-            audio: audio_input,
+            audio,
             keyframes: keyframe_tx,
         }
     } else {
-        let source = current.source.clone();
-        let volume = current.volume.unwrap_or(1.0);
-        let device = current.output.clone();
+        let (source, volume, device) = (
+            current.source.clone(),
+            current.volume.unwrap_or(1.0),
+            current.output.clone(),
+        );
         let output = output.clone();
-        let ((mic, receiver), mut native) = tokio::task::spawn_blocking(move || {
+        let (mic, mut native) = tokio::task::spawn_blocking(move || {
             let capture = microphone(source.as_deref(), &output)?;
             capture.0.set_audio_volume(volume)?;
             let playback = Playback::new(&device).or_else(|error| {
-                let _ = output.try_send(Message::Text(json!({"op":"deviceError", "error":format!("{error}. Using the system default speaker.")}).to_string().into()));
+                device_error(
+                    &output,
+                    format!("{error}. Using the system default speaker."),
+                );
                 Playback::new("")
             })?;
             Ok::<_, String>((capture, playback))
         })
         .await
         .map_err(|_| "Microphone setup failed")??;
-        native.set_volume(
-            if current.deaf {
-                0.0
-            } else {
-                current.output_volume
-            },
-            &current.users,
-        );
+        native.set_volume(current.speaker_volume(), &current.users);
         playback = Some(native);
-        voice_capture = Some((mic, receiver));
+        voice_capture = Some(mic);
         Mode::Voice {
-            video,
-            keyframes: requests.subscribe(),
             input,
             output: received,
             speaking: voice_rx,
@@ -539,15 +473,22 @@ async fn run_session(
     let mut preview_waiting = false;
     let mut pending_frame = None;
     let mut bitrate = 0;
-    let mut recovery_requests = requests.subscribe();
+    let mut recovery_requests = keyframe.subscribe();
     let mut heard = None;
     let mut tick = time::interval(Duration::from_millis(100));
+    let preview = |frame: &Frame| {
+        output
+            .try_reserve()
+            .map(|permit| permit.send(preview_frame(user, frame)))
+            .is_ok()
+    };
     loop {
-        let (capture, capture_frames) = if let Some(p) = prepared.as_mut() {
-            (&mut p.capture, &mut p.frames)
-        } else {
-            let (mic, receiver) = voice_capture.as_mut().unwrap();
-            (mic, receiver)
+        let (capture, capture_frames) = match prepared.as_mut() {
+            Some(p) => (&mut p.capture, &mut p.frames),
+            None => voice_capture
+                .as_mut()
+                .map(|(mic, frames)| (mic, frames))
+                .unwrap(),
         };
         tokio::select! {
             biased;
@@ -559,7 +500,8 @@ async fn run_session(
                     bitrate = status.video_bitrate;
                     capture.set_video_bitrate(bitrate)?;
                 }
-                if let Err(mpsc::error::TrySendError::Closed(_)) = output.try_send(Message::Text(json!({"op":"state", "id":id, "ready":status.transport_ready, "ping":status.ping}).to_string().into())) {
+                let state = text(json!({"op":"state", "id":id, "ready":status.transport_ready, "ping":status.ping}));
+                if let Err(mpsc::error::TrySendError::Closed(_)) = output.try_send(state) {
                     return Err("Browser connection closed".into());
                 }
             }
@@ -567,20 +509,18 @@ async fn run_session(
                 changed.map_err(|_| "Voice controls closed")?;
                 let next = settings.borrow_and_update().clone();
                 if next.source != current.source {
-                    let source = next.source.clone();
-                    let output_tx = output.clone();
-                    let replacement = tokio::task::spawn_blocking(move || {
-                        microphone(source.as_deref(), &output_tx)
-                    }).await.map_err(|_| "Microphone setup failed")?;
+                    let (source, notices) = (next.source.clone(), output.clone());
+                    let replacement = tokio::task::spawn_blocking(move || microphone(source.as_deref(), &notices))
+                        .await
+                        .map_err(|_| "Microphone setup failed")?;
                     match replacement {
                         Ok((replacement, receiver)) => {
-                            offset = ClockTime::from_nseconds(started.elapsed().as_nanos() as u64).max(last_pts + ClockTime::from_mseconds(20));
+                            let now = ClockTime::from_nseconds(started.elapsed().as_nanos() as u64);
+                            offset = now.max(last_pts + ClockTime::from_mseconds(20));
                             *capture = replacement;
                             *capture_frames = receiver;
                         }
-                        Err(error) => {
-                            let _ = output.try_send(Message::Text(json!({"op":"deviceError", "error":format!("{error}. Previous microphone remains active.")}).to_string().into()));
-                        }
+                        Err(error) => device_error(output, format!("{error}. Previous microphone remains active.")),
                     }
                 }
                 capture.set_audio_volume(next.volume.unwrap_or(1.0))?;
@@ -593,50 +533,37 @@ async fn run_session(
                         }).await.map_err(|_| "Speaker change failed")?;
                         native = returned;
                         if let Err(error) = result {
-                            let _ = output.try_send(Message::Text(json!({"op":"deviceError", "error":error}).to_string().into()));
+                            device_error(output, error);
                         }
                     }
-                    native.set_volume(if next.deaf { 0.0 } else { next.output_volume }, &next.users);
+                    native.set_volume(next.speaker_volume(), &next.users);
                     playback = Some(native);
                 }
                 // Remember the request so mute/volume updates do not reopen unavailable hardware.
                 current = next;
                 voice_tx.send_replace(!current.mute && !current.deaf);
             }
-            permit = send.reserve(), if streaming && pending_frame.is_some() => {
+            permit = send.reserve(), if pending_frame.is_some() => {
                 permit.map_err(|_| "Media sender closed")?.send(pending_frame.take().unwrap());
             }
-            frame = capture_frames.recv(), if !streaming || pending_frame.is_none() => {
+            frame = capture_frames.recv(), if pending_frame.is_none() => {
                 let mut frame = frame.ok_or("Capture ended")?;
                 if streaming {
                     if !preview_waiting || frame.keyframe {
-                        preview_waiting = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame))).is_err();
+                        preview_waiting = !preview(&frame);
                         if preview_waiting { let _ = capture.request_keyframe(); }
                     }
-                } else {
-                    if !*voice_tx.borrow() { continue; }
-                    frame.pts += offset; last_pts = frame.pts;
+                    pending_frame = Some(frame);
+                } else if *voice_tx.borrow() {
+                    frame.pts += offset;
+                    last_pts = frame.pts;
+                    if let Err(mpsc::error::TrySendError::Closed(_)) = send.try_send(frame) {
+                        return Err("Media sender closed".into());
+                    }
                 }
-                if streaming { pending_frame = Some(frame); }
-                else if let Err(mpsc::error::TrySendError::Closed(_)) = send.try_send(frame) { return Err("Media sender closed".into()); }
             }
             frame = frames.recv(), if !streaming => {
-                let frame = frame.ok_or("Media receiver closed")?;
-                playback.as_mut().unwrap().push(frame)?;
-            }
-            Some((user, frame)) = pictures.recv(), if !streaming => {
-                if let Some(frame) = frame {
-                    if !frame.valid() { continue; }
-                    let timestamp = ((u128::from(frame.timestamp) << 32) / 1_000_000_000) as u64;
-                    if output.try_reserve().map(|permit| permit.send(packet(5, flags(Codec::H264, frame.keyframe), user, timestamp, &frame.data))).is_ok() {
-                        frame.delivered();
-                    } else {
-                        frame.lost();
-                        requests.send_replace(());
-                    }
-                } else {
-                    let _ = output.try_send(Message::Text(json!({"op":"cameraEnded", "user":user.to_string()}).to_string().into()));
-                }
+                playback.as_mut().unwrap().push(frame.ok_or("Media receiver closed")?)?;
             }
             Ok(()) = codec_rx.changed(), if streaming => {
                 pending_frame = None;
@@ -654,22 +581,28 @@ async fn run_session(
             }
             Some(()) = keyframe_rx.recv(), if streaming => { let _ = capture.request_keyframe(); }
             _ = tick.tick() => {
-                if let Some(error) = capture.error().or_else(|| audio_capture.as_ref().and_then(Capture::error)) { return Err(error); }
-                if !streaming {
-                    let native = playback.as_mut().unwrap();
+                if let Some(error) = capture.error().or_else(|| audio_capture.as_ref().and_then(Capture::error)) {
+                    return Err(error);
+                }
+                if let Some(native) = playback.as_mut() {
                     if let Some(error) = native.error() { return Err(error); }
                     let mut speakers = native.speakers();
                     if capture.peak.swap(0, Ordering::Relaxed) > 512 { heard = Some(Instant::now()); }
-                    let speaking = *voice_tx.borrow() && heard.is_some_and(|t| t.elapsed() < Duration::from_millis(300));
-                    if speaking { speakers.push(user); }
+                    if *voice_tx.borrow() && heard.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
+                        speakers.push(user);
+                    }
                     speakers.sort_unstable();
-                    if speakers != shown && output.try_send(Message::Text(json!({"op":"speakers", "users":speakers.iter().map(u64::to_string).collect::<Vec<_>>(), "id":id}).to_string().into())).is_ok() { shown = speakers; }
+                    let users: Vec<_> = speakers.iter().map(u64::to_string).collect();
+                    if speakers != shown && output.try_send(text(json!({"op":"speakers", "users":users, "id":id}))).is_ok() {
+                        shown = speakers;
+                    }
                 }
             }
         }
     }
 }
 
+/// A binary browser message: kind, flags, user, 32.32 fixed-point seconds, then data.
 fn packet(kind: u8, flags: u8, user: u64, timestamp: u64, data: &[u8]) -> Message {
     let mut bytes = Vec::with_capacity(18 + data.len());
     bytes.extend_from_slice(&[kind, flags]);
@@ -678,20 +611,19 @@ fn packet(kind: u8, flags: u8, user: u64, timestamp: u64, data: &[u8]) -> Messag
     bytes.extend_from_slice(data);
     Message::Binary(bytes.into())
 }
-fn flags(codec: Codec, keyframe: bool) -> u8 {
-    u8::from(keyframe)
-        | match codec {
-            Codec::H265 => 2,
-            Codec::Av1 => 4,
-            _ => 0,
-        }
-}
+
 fn preview_frame(user: u64, frame: &Frame) -> Message {
+    let codec = match frame.codec {
+        Codec::H265 => 2,
+        Codec::Av1 => 4,
+        _ => 0,
+    };
+    let timestamp = ((u128::from(frame.pts.nseconds()) << 32) / 1_000_000_000) as u64;
     packet(
         2,
-        flags(frame.codec, frame.keyframe),
+        codec | u8::from(frame.keyframe),
         user,
-        ((u128::from(frame.pts.nseconds()) << 32) / 1_000_000_000) as u64,
+        timestamp,
         &frame.data,
     )
 }

@@ -20,48 +20,7 @@ type LogCallback = unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_ch
 type BufferFn = unsafe extern "C" fn(Raw, *mut *mut u8, *mut usize);
 type RosterFn = unsafe extern "C" fn(Raw, *mut *mut u64, *mut usize);
 type SignatureFn = unsafe extern "C" fn(Raw, u64, *mut *mut u8, *mut usize);
-
-fn load_library() -> Result<Library> {
-    #[cfg(not(target_os = "windows"))]
-    // SAFETY: the configured loader path must contain the trusted SDK.
-    unsafe {
-        Library::new("libdave.so").map_err(|_| ())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use libloading::os::windows::{
-            Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        };
-        let executable = std::env::current_exe().map_err(|_| ())?;
-        let mut directories = vec![executable.parent().ok_or(())?.to_path_buf()];
-        if let Some(sdk) = std::env::var_os("RELAY_DAVE_DIR") {
-            let sdk = std::path::PathBuf::from(sdk);
-            if !sdk.is_absolute() {
-                return Err(());
-            }
-            directories.push(sdk.join("bin"));
-        }
-        if let Some(path) = std::env::var_os("PATH") {
-            directories.extend(std::env::split_paths(&path).filter(|path| path.is_absolute()));
-        }
-        let path = directories
-            .into_iter()
-            .map(|path| path.join("libdave.dll"))
-            .find(|path| path.is_file())
-            .ok_or(())?;
-        // SAFETY: select only an explicit executable/SDK/PATH location. Never
-        // search the working directory, including for transitive dependencies.
-        unsafe {
-            WindowsLibrary::load_with_flags(
-                path,
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-            .map(Into::into)
-            .map_err(|_| ())
-        }
-    }
-}
+type Destroy = unsafe extern "C" fn(Raw);
 
 // Signatures match include/dave/dave.h. C enums use c_int, C bool uses bool,
 // size_t uses usize, and each opaque handle is passed as a pointer.
@@ -76,13 +35,13 @@ macro_rules! api {
         impl DaveLibrary {
             /// Load the pinned libdave 1.2.2 shared object.
             /// The identity bridge requires its shipped C++ headers and ABI,
-            /// including libstdc++ on Linux. Other versions are unsupported.
+            /// including libstdc++. Other versions are unsupported.
             /// Suppresses native process-wide logs, which can contain MLS bytes.
             fn open() -> Result<Self> {
-                // SAFETY: loading native code requires a trusted library. All
+                // SAFETY: the configured loader path must contain the trusted SDK. All
                 // symbols below use the official 1.2.2 C ABI and remain loaded.
                 unsafe {
-                    let library = load_library()?;
+                    let library = Library::new("libdave.so").map_err(|_| ())?;
                     $(let $field = *library.get::<$ty>(concat!($symbol, "\0").as_bytes())
                         .map_err(|_| ())?;)*
                     let api = Self { $($field,)* _library: library };
@@ -99,7 +58,7 @@ api! {
     max_version: unsafe extern "C" fn() -> u16 = "daveMaxSupportedProtocolVersion",
     free: unsafe extern "C" fn(Raw) = "daveFree",
     session_create: unsafe extern "C" fn(Raw, *const c_char, Option<FailureCallback>, Raw) -> Raw = "daveSessionCreate",
-    session_destroy: unsafe extern "C" fn(Raw) = "daveSessionDestroy",
+    session_destroy: Destroy = "daveSessionDestroy",
     session_version: unsafe extern "C" fn(Raw) -> u16 = "daveSessionGetProtocolVersion",
     external_sender: unsafe extern "C" fn(Raw, *const u8, usize) = "daveSessionSetExternalSender",
     key_package: BufferFn = "daveSessionGetMarshalledKeyPackage",
@@ -107,17 +66,17 @@ api! {
     commit: unsafe extern "C" fn(Raw, *const u8, usize) -> Raw = "daveSessionProcessCommit",
     welcome: unsafe extern "C" fn(Raw, *const u8, usize, *const *const c_char, usize) -> Raw = "daveSessionProcessWelcome",
     ratchet: unsafe extern "C" fn(Raw, *const c_char) -> Raw = "daveSessionGetKeyRatchet",
-    ratchet_destroy: unsafe extern "C" fn(Raw) = "daveKeyRatchetDestroy",
+    ratchet_destroy: Destroy = "daveKeyRatchetDestroy",
     commit_failed: unsafe extern "C" fn(Raw) -> bool = "daveCommitResultIsFailed",
     commit_ignored: unsafe extern "C" fn(Raw) -> bool = "daveCommitResultIsIgnored",
     commit_roster: RosterFn = "daveCommitResultGetRosterMemberIds",
     commit_signature: SignatureFn = "daveCommitResultGetRosterMemberSignature",
-    commit_destroy: unsafe extern "C" fn(Raw) = "daveCommitResultDestroy",
+    commit_destroy: Destroy = "daveCommitResultDestroy",
     welcome_roster: RosterFn = "daveWelcomeResultGetRosterMemberIds",
     welcome_signature: SignatureFn = "daveWelcomeResultGetRosterMemberSignature",
-    welcome_destroy: unsafe extern "C" fn(Raw) = "daveWelcomeResultDestroy",
+    welcome_destroy: Destroy = "daveWelcomeResultDestroy",
     encryptor_create: unsafe extern "C" fn() -> Raw = "daveEncryptorCreate",
-    encryptor_destroy: unsafe extern "C" fn(Raw) = "daveEncryptorDestroy",
+    encryptor_destroy: Destroy = "daveEncryptorDestroy",
     encryptor_ratchet: unsafe extern "C" fn(Raw, Raw) = "daveEncryptorSetKeyRatchet",
     encryptor_passthrough: unsafe extern "C" fn(Raw, bool) = "daveEncryptorSetPassthroughMode",
     assign_codec: unsafe extern "C" fn(Raw, u32, c_int) = "daveEncryptorAssignSsrcToCodec",
@@ -125,7 +84,7 @@ api! {
     encryptor_has_key: unsafe extern "C" fn(Raw) -> bool = "daveEncryptorHasKeyRatchet",
     encrypt: unsafe extern "C" fn(Raw, c_int, u32, *const u8, usize, *mut u8, usize, *mut usize) -> c_int = "daveEncryptorEncrypt",
     decryptor_create: unsafe extern "C" fn() -> Raw = "daveDecryptorCreate",
-    decryptor_destroy: unsafe extern "C" fn(Raw) = "daveDecryptorDestroy",
+    decryptor_destroy: Destroy = "daveDecryptorDestroy",
     decryptor_ratchet: unsafe extern "C" fn(Raw, Raw) = "daveDecryptorTransitionToKeyRatchet",
     decryptor_passthrough: unsafe extern "C" fn(Raw, bool) = "daveDecryptorTransitionToPassthroughMode",
     plaintext_size: unsafe extern "C" fn(Raw, c_int, usize) -> usize = "daveDecryptorGetMaxPlaintextByteSize",
@@ -153,15 +112,11 @@ impl DaveLibrary {
 struct Owned {
     raw: NonNull<c_void>,
     api: &'static DaveLibrary,
-    destroy: unsafe extern "C" fn(Raw),
+    destroy: Destroy,
 }
 
 impl Owned {
-    fn new(
-        raw: Raw,
-        api: &'static DaveLibrary,
-        destroy: unsafe extern "C" fn(Raw),
-    ) -> Result<Self> {
+    fn new(raw: Raw, api: &'static DaveLibrary, destroy: Destroy) -> Result<Self> {
         Ok(Self {
             raw: NonNull::new(raw).ok_or(())?,
             api,
@@ -185,7 +140,7 @@ impl Drop for Owned {
 unsafe fn take_array<T: Copy>(api: &DaveLibrary, data: *mut T, len: usize) -> Result<Vec<T>> {
     let result = if len == 0 {
         Ok(Vec::new())
-    } else if data.is_null() || len > (isize::MAX as usize) / std::mem::size_of::<T>() {
+    } else if data.is_null() || len > (isize::MAX as usize) / size_of::<T>() {
         Err(())
     } else {
         // SAFETY: the official API supplies len initialized, aligned elements.
@@ -204,22 +159,15 @@ fn user_id(value: &str) -> Result<CString> {
     CString::new(value).map_err(|_| ())
 }
 
-fn recognized_users(users: &[&str]) -> Result<Vec<CString>> {
-    users.iter().map(|id| user_id(id)).collect()
-}
-
 // Only flags the failure. Native reason strings are never read.
 unsafe extern "C" fn mls_failure(_: *const c_char, _: *const c_char, context: Raw) {
     // SAFETY: Session keeps this boxed flag alive through native destroy.
     unsafe { &*context.cast::<AtomicBool>() }.store(true, Ordering::Relaxed);
 }
 
-/// Roster changes returned by MLS, including each member's signature key.
-/// An empty signature in a commit delta denotes a removed member.
-pub struct RosterMember {
-    pub user_id: u64,
-    pub signature: Vec<u8>,
-}
+/// A roster member and whether it has a signature key. A commit delta member
+/// without one was removed.
+pub type RosterMember = (u64, bool);
 
 unsafe extern "C" {
     fn relayDaveIdentityCreate() -> Raw;
@@ -274,28 +222,25 @@ impl Session {
         }
         let api = DaveLibrary::load()?;
         let failure = Box::new(AtomicBool::new(false));
+        let context = ptr::from_ref(&*failure).cast_mut().cast();
         // SAFETY: callback context has a stable address until after native destroy.
         let raw = unsafe {
-            (api.session_create)(
-                ptr::null_mut(),
-                ptr::null(),
-                Some(mls_failure),
-                ptr::from_ref(&*failure).cast_mut().cast(),
-            )
+            (api.session_create)(ptr::null_mut(), ptr::null(), Some(mls_failure), context)
         };
         let session = Self {
             handle: Owned::new(raw, api, api.session_destroy)?,
             failure,
             identity: identity.clone(),
         };
+        let shared = &identity.0;
         // SAFETY: owned session, identity and C string are valid throughout the call.
         let initialized = unsafe {
             relayDaveSessionInit(
                 session.handle.ptr(),
-                identity.0.raw.as_ptr(),
+                shared.raw.as_ptr(),
                 version,
                 group_id,
-                identity.0.user.as_ptr(),
+                shared.user.as_ptr(),
             )
         };
         session.check()?;
@@ -349,21 +294,26 @@ impl Session {
         proposals: &[u8],
         recognized: &[&str],
     ) -> Result<Option<Vec<u8>>> {
-        let users = recognized_users(recognized)?;
+        let users = recognized
+            .iter()
+            .map(|id| user_id(id))
+            .collect::<Result<Vec<_>>>()?;
         let pointers: Vec<_> = users.iter().map(|id| id.as_ptr()).collect();
         let (mut data, mut len) = (ptr::null_mut(), 0);
+        let api = self.handle.api;
         // SAFETY: all input slices/strings and output pointers remain valid for the call.
         let result = unsafe {
-            (self.handle.api.proposals)(
+            let (input, size) = (proposals.as_ptr(), proposals.len());
+            (api.proposals)(
                 self.handle.ptr(),
-                proposals.as_ptr(),
-                proposals.len(),
+                input,
+                size,
                 pointers.as_ptr(),
                 pointers.len(),
                 &mut data,
                 &mut len,
             );
-            take_array(self.handle.api, data, len)
+            take_array(api, data, len)
         };
         self.check()?;
         Ok(Some(result?).filter(|bytes| !bytes.is_empty()))
@@ -396,7 +346,10 @@ impl Session {
         welcome: &[u8],
         recognized: &[&str],
     ) -> Result<Vec<RosterMember>> {
-        let users = recognized_users(recognized)?;
+        let users = recognized
+            .iter()
+            .map(|id| user_id(id))
+            .collect::<Result<Vec<_>>>()?;
         let pointers: Vec<_> = users.iter().map(|id| id.as_ptr()).collect();
         let api = self.handle.api;
         // SAFETY: stable input arrays. Nullable result is checked and owned immediately.
@@ -427,18 +380,15 @@ impl Session {
     /// Created without keys. Transition with `transition_sender` before use.
     pub fn encryptor(&self) -> Result<Encryptor> {
         let api = self.handle.api;
-        // SAFETY: matching create/destroy functions from the retained library.
-        let handle = Owned::new(
-            unsafe { (api.encryptor_create)() },
-            api,
-            api.encryptor_destroy,
-        )?;
-        // SAFETY: live handle. Passthrough is never enabled.
-        unsafe { (api.encryptor_passthrough)(handle.ptr(), false) };
-        Ok(Encryptor {
-            handle,
-            scratch: Vec::new(),
-        })
+        // SAFETY: matching create/destroy functions from the retained library. Passthrough is never enabled.
+        unsafe {
+            let handle = Owned::new((api.encryptor_create)(), api, api.encryptor_destroy)?;
+            (api.encryptor_passthrough)(handle.ptr(), false);
+            Ok(Encryptor {
+                handle,
+                scratch: Vec::new(),
+            })
+        }
     }
 
     /// Bound to one sender. Keep one per remote user across epochs and
@@ -446,19 +396,16 @@ impl Session {
     pub fn decryptor(&self, id: &str) -> Result<Decryptor> {
         let user_id = user_id(id)?;
         let api = self.handle.api;
-        // SAFETY: matching create/destroy functions from the retained library.
-        let handle = Owned::new(
-            unsafe { (api.decryptor_create)() },
-            api,
-            api.decryptor_destroy,
-        )?;
-        // SAFETY: live handle. Plaintext passthrough is never enabled.
-        unsafe { (api.decryptor_passthrough)(handle.ptr(), false) };
-        Ok(Decryptor {
-            handle,
-            user_id,
-            has_key: false,
-        })
+        // SAFETY: matching create/destroy functions from the retained library. Passthrough is never enabled.
+        unsafe {
+            let handle = Owned::new((api.decryptor_create)(), api, api.decryptor_destroy)?;
+            (api.decryptor_passthrough)(handle.ptr(), false);
+            Ok(Decryptor {
+                handle,
+                user_id,
+                has_key: false,
+            })
+        }
     }
 
     pub fn transition_sender(&mut self, encryptor: &mut Encryptor) -> Result<()> {
@@ -486,8 +433,10 @@ unsafe fn roster(
 ) -> Result<Vec<RosterMember>> {
     let (mut ids, mut len) = (ptr::null_mut(), 0);
     // SAFETY: live result of the matching type, valid output pointers.
-    unsafe { get_ids(result.ptr(), &mut ids, &mut len) };
-    let ids = unsafe { take_array(result.api, ids, len) }?;
+    let ids = unsafe {
+        get_ids(result.ptr(), &mut ids, &mut len);
+        take_array(result.api, ids, len)
+    }?;
     ids.into_iter()
         .map(|user_id| {
             let (mut data, mut len) = (ptr::null_mut(), 0);
@@ -496,7 +445,7 @@ unsafe fn roster(
                 get_signature(result.ptr(), user_id, &mut data, &mut len);
                 take_array(result.api, data, len)
             }?;
-            Ok(RosterMember { user_id, signature })
+            Ok((user_id, !signature.is_empty()))
         })
         .collect()
 }
@@ -511,6 +460,31 @@ fn native(codec: Codec) -> (c_int, c_int) {
     }
 }
 
+/// Runs a native transform into `output` after its existing bytes. A successful
+/// SDK call initialized exactly `written` bytes and never returns plaintext on failure.
+unsafe fn transform(
+    output: &mut Vec<u8>,
+    capacity: usize,
+    call: impl FnOnce(*mut u8, usize, &mut usize) -> c_int,
+) -> Result<()> {
+    if capacity == 0 {
+        return Err(());
+    }
+    output.try_reserve(capacity).map_err(|_| ())?;
+    let start = output.len();
+    let mut written = 0;
+    let code = call(
+        unsafe { output.as_mut_ptr().add(start) },
+        capacity,
+        &mut written,
+    );
+    if code != 0 || written == 0 || written > capacity {
+        return Err(());
+    }
+    unsafe { output.set_len(start + written) };
+    Ok(())
+}
+
 pub struct Encryptor {
     handle: Owned,
     scratch: Vec<u8>,
@@ -519,43 +493,30 @@ pub struct Encryptor {
 impl Encryptor {
     /// Encrypt one complete Opus or encoded video frame. Errors never return plaintext.
     pub fn encrypt(&mut self, ssrc: u32, codec: Codec, frame: &[u8]) -> Result<&[u8]> {
-        if frame.is_empty() {
-            return Err(());
-        }
-        let api = self.handle.api;
+        let (api, raw) = (self.handle.api, self.handle.ptr());
         let (codec, media) = native(codec);
         // SAFETY: live exclusively borrowed handle, valid frame/output slices.
         unsafe {
-            if !(api.encryptor_has_key)(self.handle.ptr()) {
+            if frame.is_empty() || !(api.encryptor_has_key)(raw) {
                 return Err(());
             }
-            (api.assign_codec)(self.handle.ptr(), ssrc, codec);
-            let capacity = (api.ciphertext_size)(self.handle.ptr(), media, frame.len());
-            if capacity == 0 {
-                return Err(());
-            }
+            (api.assign_codec)(raw, ssrc, codec);
+            let capacity = (api.ciphertext_size)(raw, media, frame.len());
             self.scratch.clear();
-            if self.scratch.capacity() < capacity {
-                self.scratch.try_reserve(capacity).map_err(|_| ())?;
-            }
-            let mut written = 0;
-            let code = (api.encrypt)(
-                self.handle.ptr(),
-                media,
-                ssrc,
-                frame.as_ptr(),
-                frame.len(),
-                self.scratch.as_mut_ptr(),
-                self.scratch.capacity(),
-                &mut written,
-            );
-            if code != 0 || written == 0 || written > self.scratch.capacity() {
-                return Err(());
-            }
-            // SAFETY: a successful SDK call initialized exactly `written` output bytes.
-            self.scratch.set_len(written);
-            Ok(&self.scratch)
+            transform(&mut self.scratch, capacity, |out, size, written| {
+                (api.encrypt)(
+                    raw,
+                    media,
+                    ssrc,
+                    frame.as_ptr(),
+                    frame.len(),
+                    out,
+                    size,
+                    written,
+                )
+            })?;
         }
+        Ok(&self.scratch)
     }
 }
 
@@ -566,45 +527,22 @@ pub struct Decryptor {
 }
 
 impl Decryptor {
-    pub fn decrypt(&mut self, codec: Codec, frame: &[u8]) -> Result<Vec<u8>> {
+    /// Decrypts one frame into a new buffer after `header`.
+    pub fn decrypt(&mut self, codec: Codec, frame: &[u8], header: &[u8]) -> Result<Vec<u8>> {
         if !self.has_key || frame.is_empty() {
             return Err(());
         }
-        let api = self.handle.api;
+        let (api, raw) = (self.handle.api, self.handle.ptr());
         let media = native(codec).1;
         // SAFETY: live exclusively borrowed handle, valid frame/output slices.
         unsafe {
-            let capacity = (api.plaintext_size)(self.handle.ptr(), media, frame.len());
-            let mut output = output_buffer(capacity)?;
-            let mut written = 0;
-            let code = (api.decrypt)(
-                self.handle.ptr(),
-                media,
-                frame.as_ptr(),
-                frame.len(),
-                output.as_mut_ptr(),
-                output.capacity(),
-                &mut written,
-            );
-            finish_frame(code, output, written)
+            let capacity = (api.plaintext_size)(raw, media, frame.len());
+            let mut output = Vec::with_capacity(header.len() + capacity);
+            output.extend_from_slice(header);
+            transform(&mut output, capacity, |out, size, written| {
+                (api.decrypt)(raw, media, frame.as_ptr(), frame.len(), out, size, written)
+            })?;
+            Ok(output)
         }
     }
-}
-
-fn output_buffer(capacity: usize) -> Result<Vec<u8>> {
-    if capacity == 0 {
-        return Err(());
-    }
-    let mut output = Vec::new();
-    output.try_reserve_exact(capacity).map_err(|_| ())?;
-    Ok(output)
-}
-
-unsafe fn finish_frame(code: c_int, mut output: Vec<u8>, written: usize) -> Result<Vec<u8>> {
-    if code != 0 || written == 0 || written > output.capacity() {
-        return Err(());
-    }
-    // SAFETY: a successful SDK call initialized exactly `written` output bytes.
-    unsafe { output.set_len(written) };
-    Ok(output)
 }

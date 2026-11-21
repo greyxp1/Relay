@@ -9,104 +9,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(super) const MODE: &str = "aead_aes256_gcm_rtpsize";
 // Leave room for UDP/IP and Discord's forwarding overhead on minimum-MTU paths.
 pub(super) const MTU: usize = 1200;
-pub(super) const H264_PT: u8 = 101;
-pub(super) const H264_RTX_PT: u8 = 102;
+pub(super) const OPUS_PT: u8 = 120;
 
 /// Media and RTX payload types advertised in Select Protocol. 96 is reserved for probes.
 pub(super) fn payload_types(codec: Codec) -> (u8, u8) {
     match codec {
         Codec::H265 => (103, 104),
         Codec::Av1 => (109, 110),
-        _ => (H264_PT, H264_RTX_PT),
+        _ => (101, 102),
     }
 }
 
-/// RFC 8285 one-byte elements in Discord's sender-side numbering: transport
-/// sequence (5) and abs-send-time (3), then screen content (7) and RID "100"
-/// (11) unless repairing. Padded to whole words.
-fn video_extensions(sequence: u16, repair: bool) -> [u8; 16] {
-    let now = SystemTime::now()
+fn now() -> std::time::Duration {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    // 6.18 fixed point seconds.
-    let send =
-        ((u64::from(now.subsec_nanos()) << 18) / 1_000_000_000) | ((now.as_secs() & 63) << 18);
-    let [high, low] = sequence.to_be_bytes();
-    let [_, _, _, _, _, a, b, c] = send.to_be_bytes();
-    let mut extensions = [0; 16];
-    extensions[..7].copy_from_slice(&[0x51, high, low, 0x32, a, b, c]);
-    if !repair {
-        extensions[7..13].copy_from_slice(&[0x70, 1, 0xb2, b'1', b'0', b'0']);
-    }
-    extensions
+        .unwrap_or_default()
 }
 
+#[derive(Default)]
 pub(super) struct Feedback {
     pub keyframe: bool,
     pub nacks: Vec<u16>,
-    pub transport: Vec<TransportFeedback>,
     pub receiver_bitrate: Option<u32>,
-}
-
-pub(super) struct TransportFeedback {
-    /// Reference time in 64 ms units, wrapping at 24 bits.
-    pub reference: u32,
-    pub count: u8,
-    /// Transport sequence, and arrival in microseconds after the reference.
-    pub packets: Vec<(u16, Option<i64>)>,
-}
-
-/// draft-holmer-rmcat-transport-wide-cc-extensions-01 feedback. Outer None is
-/// malformed, inner None is too large to track.
-fn transport_feedback(part: &[u8]) -> Option<Option<TransportFeedback>> {
-    let base = u16::from_be_bytes(part.get(12..14)?.try_into().ok()?);
-    let total = usize::from(u16::from_be_bytes(part.get(14..16)?.try_into().ok()?));
-    let &[a, b, c, count] = part.get(16..20)? else {
-        return None;
-    };
-    let reference = u32::from_be_bytes([0, a, b, c]);
-    if total > 4096 {
-        return Some(None);
-    }
-    let mut symbols = Vec::with_capacity(total);
-    let mut at = 20;
-    while symbols.len() < total {
-        let chunk = u16::from_be_bytes(part.get(at..at + 2)?.try_into().ok()?);
-        at += 2;
-        if chunk & 0x8000 == 0 {
-            let run = usize::from(chunk & 0x1fff).min(total - symbols.len());
-            symbols.extend(std::iter::repeat_n((chunk >> 13) & 3, run));
-        } else if chunk & 0x4000 == 0 {
-            symbols.extend((0..14).rev().map(|bit| (chunk >> bit) & 1));
-        } else {
-            symbols.extend((0..7).rev().map(|pair| (chunk >> (pair * 2)) & 3));
-        }
-    }
-    symbols.truncate(total);
-    let mut time = 0i64;
-    let mut packets = Vec::with_capacity(total);
-    for (index, symbol) in symbols.into_iter().enumerate() {
-        let arrival = match symbol {
-            0 => None,
-            1 => {
-                time += i64::from(*part.get(at)?) * 250;
-                at += 1;
-                Some(time)
-            }
-            2 => {
-                time += i64::from(i16::from_be_bytes(part.get(at..at + 2)?.try_into().ok()?)) * 250;
-                at += 2;
-                Some(time)
-            }
-            _ => return None,
-        };
-        packets.push((base.wrapping_add(index as u16), arrival));
-    }
-    Some(Some(TransportFeedback {
-        reference,
-        count,
-        packets,
-    }))
 }
 
 /// Parse authenticated compound or reduced-size RTCP, rejecting the whole
@@ -115,12 +39,8 @@ pub(super) fn feedback(mut packet: &[u8], video_ssrc: u32) -> Option<Feedback> {
     if packet.is_empty() || packet.len() > 4096 {
         return None;
     }
-    let mut feedback = Feedback {
-        keyframe: false,
-        nacks: Vec::new(),
-        transport: Vec::new(),
-        receiver_bitrate: None,
-    };
+    let mut feedback = Feedback::default();
+    let ssrc = video_ssrc.to_be_bytes();
     while !packet.is_empty() {
         if packet.len() < 4 || packet[0] >> 6 != 2 {
             return None;
@@ -130,6 +50,7 @@ pub(super) fn feedback(mut packet: &[u8], video_ssrc: u32) -> Option<Feedback> {
             return None;
         }
         let mut part = &packet[..size];
+        packet = &packet[size..];
         if part[0] & 32 != 0 {
             let padding = usize::from(*part.last()?);
             // Discord can append NACK after a padded TWCC subpacket. Each
@@ -140,87 +61,55 @@ pub(super) fn feedback(mut packet: &[u8], video_ssrc: u32) -> Option<Feedback> {
             part = &part[..size - padding];
         }
         let count = usize::from(part[0] & 31);
-        match part[1] {
-            200 | 201 => {
-                let start = if part[1] == 200 { 28 } else { 8 };
-                let end = start + count * 24;
+        match (part[1], count) {
+            (200 | 201, _) => {
+                let end = if part[1] == 200 { 28 } else { 8 } + count * 24;
                 // SR/RR may carry aligned profile-specific extensions.
                 if part.len() < end || !(part.len() - end).is_multiple_of(4) {
                     return None;
                 }
             }
-            205 | 206 => {
-                if part.len() < 12 {
+            (205 | 206, _) if part.len() < 12 => return None,
+            (205, 1) => {
+                if part.len() < 16 || !(part.len() - 12).is_multiple_of(4) {
                     return None;
                 }
-                let matches = part[8..12] == video_ssrc.to_be_bytes();
-                match (part[1], count) {
-                    (205, 1) => {
-                        if part.len() < 16 || !(part.len() - 12).is_multiple_of(4) {
-                            return None;
-                        }
-                        if matches {
-                            for nack in part[12..].as_chunks::<4>().0 {
-                                let pid = u16::from_be_bytes([nack[0], nack[1]]);
-                                let mask = u16::from_be_bytes([nack[2], nack[3]]);
-                                for bit in 0..=16 {
-                                    if bit == 0 || mask & (1 << (bit - 1)) != 0 {
-                                        let sequence = pid.wrapping_add(bit);
-                                        if feedback.nacks.len() < 64
-                                            && !feedback.nacks.contains(&sequence)
-                                        {
-                                            feedback.nacks.push(sequence);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Transport feedback covers every SSRC on this connection.
-                    (205, 15) => {
-                        if let Some(report) = transport_feedback(part)? {
-                            if feedback.transport.len() < 16 {
-                                feedback.transport.push(report);
-                            }
-                        }
-                    }
-                    (206, 15) if part.get(12..16) == Some(b"REMB") => {
-                        if part.len() < 20 || part.len() != 20 + usize::from(part[16]) * 4 {
-                            return None;
-                        }
-                        if part[20..]
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .any(|ssrc| *ssrc == video_ssrc.to_be_bytes())
-                        {
-                            let exponent = u32::from(part[17] >> 2);
-                            let mantissa = (u64::from(part[17] & 3) << 16)
-                                | (u64::from(part[18]) << 8)
-                                | u64::from(part[19]);
-                            let bitrate = mantissa
-                                .saturating_mul(1u64 << exponent)
-                                .min(u64::from(u32::MAX))
-                                as u32;
-                            feedback.receiver_bitrate = Some(
-                                feedback
-                                    .receiver_bitrate
-                                    .map_or(bitrate, |old| old.min(bitrate)),
-                            );
-                        }
-                    }
-                    (206, 1) => {
-                        if part.len() != 12 {
-                            return None;
-                        }
-                        feedback.keyframe |= matches;
-                    }
-                    _ => {}
+                if part[8..12] != ssrc {
+                    continue;
                 }
+                for nack in part[12..].as_chunks::<4>().0 {
+                    let pid = u16::from_be_bytes([nack[0], nack[1]]);
+                    let mask = u16::from_be_bytes([nack[2], nack[3]]);
+                    for bit in (0..=16).filter(|b| *b == 0 || mask & (1 << (b - 1)) != 0) {
+                        let sequence = pid.wrapping_add(bit);
+                        if feedback.nacks.len() < 64 && !feedback.nacks.contains(&sequence) {
+                            feedback.nacks.push(sequence);
+                        }
+                    }
+                }
+            }
+            (206, 15) if part.get(12..16) == Some(b"REMB") => {
+                if part.len() < 20 || part.len() != 20 + usize::from(part[16]) * 4 {
+                    return None;
+                }
+                if part[20..].as_chunks::<4>().0.contains(&ssrc) {
+                    let mantissa =
+                        u64::from(u32::from_be_bytes([0, part[17] & 3, part[18], part[19]]));
+                    let bitrate = mantissa
+                        .saturating_mul(1 << (part[17] >> 2))
+                        .min(u32::MAX.into()) as u32;
+                    let old = feedback.receiver_bitrate.unwrap_or(u32::MAX);
+                    feedback.receiver_bitrate = Some(old.min(bitrate));
+                }
+            }
+            (206, 1) => {
+                if part.len() != 12 {
+                    return None;
+                }
+                feedback.keyframe |= part[8..12] == ssrc;
             }
             _ => {}
         }
-        packet = &packet[size..];
     }
     Some(feedback)
 }
@@ -228,7 +117,7 @@ pub(super) fn feedback(mut packet: &[u8], video_ssrc: u32) -> Option<Feedback> {
 pub(super) struct Cipher {
     aes: Aes256Gcm,
     // Shared by RTP and RTCP. A new key is mandatory before exhaustion.
-    counter: u64,
+    counter: u32,
     scratch: Vec<u8>,
 }
 impl Cipher {
@@ -240,15 +129,11 @@ impl Cipher {
         })
     }
     pub(super) fn seal(&mut self, header: &[u8], data: &[&[u8]]) -> Result<&[u8], String> {
-        let count = u32::try_from(self.counter).map_err(|_| "Transport nonce exhausted")?;
-        self.counter += 1;
+        let count = self.counter;
+        self.counter = count.checked_add(1).ok_or("Transport nonce exhausted")?;
         let mut nonce = [0; 12];
         nonce[..4].copy_from_slice(&count.to_be_bytes());
-        let needed = header.len() + data.iter().map(|p| p.len()).sum::<usize>() + 20;
         self.scratch.clear();
-        if self.scratch.capacity() < needed {
-            self.scratch.reserve(needed);
-        }
         self.scratch.extend_from_slice(header);
         for part in data {
             self.scratch.extend_from_slice(part);
@@ -266,30 +151,23 @@ impl Cipher {
         Ok(&self.scratch)
     }
     pub(super) fn open<'a>(&self, packet: &'a mut [u8], clear: usize) -> Option<&'a [u8]> {
-        let end = packet.len().checked_sub(20)?;
-        if clear > end {
-            return None;
-        }
+        let end = packet.len().checked_sub(20).filter(|end| clear <= *end)?;
         let mut nonce = [0; 12];
         nonce[..4].copy_from_slice(&packet[end + 16..]);
         let (header, encrypted) = packet[..end + 16].split_at_mut(clear);
         let (payload, tag) = encrypted.split_at_mut(end - clear);
+        let tag = Tag::from_slice(tag);
         self.aes
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                header,
-                payload,
-                Tag::from_slice(tag),
-            )
+            .decrypt_in_place_detached(Nonce::from_slice(&nonce), header, payload, tag)
             .ok()?;
         Some(&packet[..end])
     }
 }
 
-pub(super) fn header(sequence: u16, timestamp: u32, ssrc: u32, marker: bool) -> [u8; 12] {
+pub(super) fn header(sequence: u16, timestamp: u32, ssrc: u32, marker: bool, kind: u8) -> [u8; 12] {
     let mut h = [
         0x80,
-        120 | if marker { 0x80 } else { 0 },
+        kind | u8::from(marker) << 7,
         0,
         0,
         0,
@@ -307,43 +185,58 @@ pub(super) fn header(sequence: u16, timestamp: u32, ssrc: u32, marker: bool) -> 
     h
 }
 
-/// RTX preserves DAVE ciphertext and uses the allocated SSRC association.
-/// RTX carries no RID, only the congestion control extensions.
+/// Video RTP header and its length. RFC 8285 one-byte elements in Discord's
+/// sender-side numbering: transport sequence (5) and abs-send-time (3), then
+/// screen content (7) and RID "100" (11) unless repairing. RTX keeps DAVE
+/// ciphertext and appends the original sequence.
 pub(super) fn video_header(
     sequence: u16,
     ssrc: u32,
     codec: Codec,
-    transport_sequence: u16,
+    transport: u16,
     packet: &super::pacer::Packet,
 ) -> ([u8; 34], usize) {
-    let repair = packet.original_sequence.is_some();
     let (media, rtx) = payload_types(codec);
-    let size = if repair { 8 } else { 16 };
-    let mut header = [0; 34];
-    header[..12].copy_from_slice(&self::header(
+    let original = packet.original_sequence;
+    let size = if original.is_some() { 8 } else { 16 };
+    let kind = if original.is_some() { rtx } else { media };
+    let mut h = [0; 34];
+    h[..12].copy_from_slice(&header(
         sequence,
         packet.timestamp,
         ssrc,
         packet.marker,
+        kind,
     ));
-    header[0] |= 0x10;
-    header[1] = (header[1] & 0x80) | if repair { rtx } else { media };
-    header[12..16].copy_from_slice(&[0xbe, 0xde, 0, (size / 4) as u8]);
-    header[16..16 + size].copy_from_slice(&video_extensions(transport_sequence, repair)[..size]);
-    if let Some(original) = packet.original_sequence {
-        header[16 + size..18 + size].copy_from_slice(&original.to_be_bytes());
+    h[0] |= 0x10;
+    let now = now();
+    // 6.18 fixed point seconds.
+    let send =
+        ((u64::from(now.subsec_nanos()) << 18) / 1_000_000_000) | ((now.as_secs() & 63) << 18);
+    let [_, _, _, _, _, a, b, c] = send.to_be_bytes();
+    let [high, low] = transport.to_be_bytes();
+    h[12..23].copy_from_slice(&[
+        0xbe,
+        0xde,
+        0,
+        size as u8 / 4,
+        0x51,
+        high,
+        low,
+        0x32,
+        a,
+        b,
+        c,
+    ]);
+    match original {
+        Some(original) => h[24..26].copy_from_slice(&original.to_be_bytes()),
+        None => h[23..29].copy_from_slice(&[0x70, 1, 0xb2, b'1', b'0', b'0']),
     }
-    (header, 16 + size + usize::from(repair) * 2)
+    (h, 16 + size + usize::from(original.is_some()) * 2)
 }
 
-pub(super) struct Packet<'a> {
-    pub marker: bool,
-    pub sequence: u16,
-    pub ssrc: u32,
-    pub timestamp: u32,
-    pub payload: &'a [u8],
-}
-
+/// Header length of an encrypted RTP packet. The extension preamble is
+/// authenticated cleartext while its content is encrypted.
 pub(super) fn clear_len(packet: &[u8]) -> Option<usize> {
     if packet.len() < 12 || packet[0] >> 6 != 2 {
         return None;
@@ -352,65 +245,43 @@ pub(super) fn clear_len(packet: &[u8]) -> Option<usize> {
     (packet.len() >= size).then_some(size)
 }
 
-// Extension preamble is authenticated cleartext, extension content is encrypted.
-pub(super) fn opus<'a>(header: &[u8], plain: &'a [u8]) -> Option<Packet<'a>> {
-    if header[1] & 127 != 120 {
+/// The Opus payload of a decrypted packet without extension content or padding.
+pub(super) fn opus<'a>(header: &[u8], plain: &'a [u8]) -> Option<&'a [u8]> {
+    if header[1] & 127 != OPUS_PT {
         return None;
     }
-    media(header, plain)
+    let start = if header[0] & 16 != 0 {
+        usize::from(u16::from_be_bytes([
+            header[header.len() - 2],
+            header[header.len() - 1],
+        ])) * 4
+    } else {
+        0
+    };
+    let padding = if header[0] & 32 != 0 {
+        usize::from(*plain.last().filter(|p| **p != 0)?)
+    } else {
+        0
+    };
+    plain
+        .get(start..plain.len().checked_sub(padding)?)
+        .filter(|p| !p.is_empty())
 }
 
-pub(super) fn media<'a>(header: &[u8], plain: &'a [u8]) -> Option<Packet<'a>> {
-    let mut start = 0;
-    if header[0] & 16 != 0 {
-        start = usize::from(u16::from_be_bytes(
-            header[header.len() - 2..].try_into().ok()?,
-        )) * 4;
-    }
-    let mut end = plain.len();
-    if header[0] & 32 != 0 {
-        let padding = usize::from(*plain.last()?);
-        if padding == 0 || padding > end {
-            return None;
-        }
-        end -= padding;
-    }
-    if start >= end {
-        return None;
-    }
-    Some(Packet {
-        marker: header[1] & 0x80 != 0,
-        sequence: u16::from_be_bytes(header[2..4].try_into().ok()?),
-        ssrc: u32::from_be_bytes(header[8..12].try_into().ok()?),
-        timestamp: u32::from_be_bytes(header[4..8].try_into().ok()?),
-        payload: &plain[start..end],
-    })
-}
-
-pub(super) fn sender_report(
-    ssrc: u32,
-    timestamp: u32,
-    packets: u64,
-    octets: u64,
-) -> Result<Vec<u8>, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "Invalid system clock")?;
+pub(super) fn sender_report(ssrc: u32, timestamp: u32, packets: u64, octets: u64) -> Vec<u8> {
+    let now = now();
     let mut report = vec![0x80, 200, 0, 6];
     report.extend(ssrc.to_be_bytes());
     report.extend((now.as_secs().wrapping_add(2_208_988_800) as u32).to_be_bytes());
-    report.extend(((((u64::from(now.subsec_nanos())) << 32) / 1_000_000_000) as u32).to_be_bytes());
+    report.extend((((u64::from(now.subsec_nanos()) << 32) / 1_000_000_000) as u32).to_be_bytes());
     report.extend(timestamp.to_be_bytes());
     report.extend((packets as u32).to_be_bytes());
     report.extend((octets as u32).to_be_bytes());
     // Compound RTCP requires an SDES CNAME. This reveals no account identifier.
-    let cname = b"relay";
-    report.extend([0x81, 202, 0, 4]);
+    report.extend([0x81, 202, 0, 3]);
     report.extend(ssrc.to_be_bytes());
-    report.extend([1, cname.len() as u8]);
-    report.extend(cname);
-    report.extend([0, 0, 0]);
-    Ok(report)
+    report.extend(*b"\x01\x05relay\0");
+    report
 }
 
 pub(super) fn receiver_report(ssrc: u32) -> [u8; 8] {

@@ -129,8 +129,7 @@ export class BrowserPlayback {
   packet(bytes: Uint8Array) {
     if (this.closed) return
     if (bytes.length < 18) return this.fail(new Error('Invalid local media frame.'))
-    const owner = bytes[0] === 2 || bytes[0] === 5
-      ? (bytes[0] === 5 ? 'camera:' : '') + new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(2).toString() : undefined
+    const owner = bytes[0] === 2 ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(2).toString() : undefined
     if (bytes.length > 1048594) return this.fail(new Error('Invalid local media frame.'), owner)
     if (owner && this.failed.has(owner)) return
     if (owner && this.screens.get(owner)?.recovering) {
@@ -145,9 +144,9 @@ export class BrowserPlayback {
   }
   decodePacket(bytes: Uint8Array) {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    const user = (bytes[0] === 5 ? 'camera:' : '') + view.getBigUint64(2).toString()
+    const user = view.getBigUint64(2).toString()
     if (bytes[0] === 4) { this.reset(user); return }
-    if (bytes[0] !== 2 && bytes[0] !== 5) throw new Error('Invalid local media frame type.')
+    if (bytes[0] !== 2) throw new Error('Invalid local media frame type.')
     const time = Number(view.getBigUint64(10)) / 4294967296
     const screen = this.screen(user)
     let entry = this.decoders.get(user)
@@ -167,7 +166,7 @@ export class BrowserPlayback {
             }
           }).catch(error => { if (active()) this.fail(error, user) }).finally(() => frame.close())
         },
-        error: error => { if (active()) { if (user.startsWith("camera:")) this.recover(user); else this.fail(error, user) } },
+        error: error => { if (active()) this.fail(error, user) },
       })
       entry = { last: -1, decoder }
       this.decoders.set(user, entry)

@@ -1,28 +1,11 @@
-//! Send-side estimation from transport-wide feedback, a small GoogCC.
-//! Transport feedback estimates the uplink. REMB also limits this single
-//! video layer for receivers beyond Discord's forwarding server.
-use super::rtp::TransportFeedback;
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+//! Send rate from REMB and NACKed loss, limited by Media Sink Wants.
+use crate::capture::{VIDEO_MIN_BITRATE, VIDEO_START_BITRATE};
+use std::time::{Duration, Instant};
 
 /// Discord's Go Live minimum.
 const MINIMUM: u32 = 500_000;
 const RECEIVER_AGE: Duration = Duration::from_secs(5);
-const HISTORY: Duration = Duration::from_secs(2);
-/// Smoothed queueing delay that means overuse, and below which rate may grow.
-const OVERUSE_MS: f64 = 50.0;
-const NORMAL_MS: f64 = 15.0;
-
-struct Sent {
-    sequence: u16,
-    at: Instant,
-    bytes: u32,
-    cluster: Option<u16>,
-    arrival: Option<i64>,
-    reported: bool,
-}
+const WINDOW: Duration = Duration::from_secs(1);
 
 pub(super) struct Rate {
     maximum: u32,
@@ -31,48 +14,24 @@ pub(super) struct Rate {
     estimate: f64,
     reported: u32,
     receiver: Option<(u32, Instant)>,
-    sent: VecDeque<Sent>,
-    origin: Instant,
-    reference: Option<(u32, i64)>,
-    count: Option<u8>,
-    floor: [i64; 2],
-    floor_since: Instant,
-    delay: f64,
-    loss: f64,
-    started: Instant,
-    feedback: bool,
-    increased: Instant,
-    decreased: Instant,
-    cluster: u16,
-    probe: Option<Instant>,
-    next_probe: Instant,
+    sent: u32,
+    lost: u32,
+    window: Instant,
 }
 
 impl Rate {
     pub fn new(max_bitrate: u32, now: Instant) -> Self {
         let maximum = max_bitrate.max(MINIMUM) / 1000 * 1000;
-        let start = crate::capture::VIDEO_START_BITRATE.min(maximum);
+        let start = VIDEO_START_BITRATE.min(maximum);
         Self {
             maximum,
             cap: maximum,
             estimate: f64::from(start),
             reported: start,
             receiver: None,
-            sent: VecDeque::new(),
-            origin: now,
-            reference: None,
-            count: None,
-            floor: [i64::MAX; 2],
-            floor_since: now,
-            delay: 0.0,
-            loss: 0.0,
-            started: now,
-            feedback: false,
-            increased: now,
-            decreased: now,
-            cluster: 0,
-            probe: None,
-            next_probe: now,
+            sent: 0,
+            lost: 0,
+            window: now,
         }
     }
 
@@ -81,29 +40,18 @@ impl Rate {
     }
 
     fn receiver_bitrate(&self, now: Instant) -> Option<u32> {
-        self.receiver
-            .filter(|(_, at)| now.saturating_duration_since(*at) < RECEIVER_AGE)
-            .map(|(bitrate, _)| bitrate)
-    }
-
-    fn ceiling(&self, now: Instant) -> u32 {
-        let ceiling = self.maximum.min(self.cap);
-        match self.receiver_bitrate(now) {
-            Some(receiver) => ceiling.min(receiver.max(crate::capture::VIDEO_MIN_BITRATE)),
-            _ => ceiling,
-        }
+        let fresh = self
+            .receiver
+            .filter(|(_, at)| now.saturating_duration_since(*at) < RECEIVER_AGE);
+        fresh.map(|(bitrate, _)| bitrate.max(VIDEO_MIN_BITRATE))
     }
 
     /// Reports changes of at least 5 percent, and any change at the ceiling.
     fn apply(&mut self, now: Instant) -> Option<u32> {
-        let ceiling = self.ceiling(now);
-        // Without transport feedback, follow REMB as before.
-        if !self.feedback
-            && self.receiver_bitrate(now).is_some()
-            && now.saturating_duration_since(self.started) >= Duration::from_secs(3)
-        {
-            self.estimate = f64::from(ceiling);
-        }
+        let ceiling = self
+            .maximum
+            .min(self.cap)
+            .min(self.receiver_bitrate(now).unwrap_or(u32::MAX));
         self.estimate = self
             .estimate
             .min(f64::from(ceiling))
@@ -128,230 +76,42 @@ impl Rate {
         self.apply(now)
     }
 
-    pub fn sent(&mut self, sequence: u16, bytes: usize, probe: bool, now: Instant) {
-        while self.sent.front().is_some_and(|entry| {
-            now.saturating_duration_since(entry.at) > HISTORY || self.sent.len() >= 8192
-        }) {
-            self.sent.pop_front();
-        }
-        // Feedback lookup relies on consecutive sequence numbers.
-        if self
-            .sent
-            .back()
-            .is_some_and(|last| last.sequence.wrapping_add(1) != sequence)
-        {
-            self.sent.clear();
-        }
-        self.sent.push_back(Sent {
-            sequence,
-            at: now,
-            bytes: bytes as u32,
-            cluster: (probe && self.probe.is_some()).then_some(self.cluster),
-            arrival: None,
-            reported: false,
-        });
+    pub fn sent(&mut self) {
+        self.sent = self.sent.saturating_add(1);
     }
 
-    fn index(&self, sequence: u16) -> Option<usize> {
-        let index = usize::from(sequence.wrapping_sub(self.sent.front()?.sequence));
-        (index < self.sent.len()).then_some(index)
+    pub fn lost(&mut self, packets: usize) {
+        self.lost = self.lost.saturating_add(packets as u32);
     }
 
-    pub fn feedback(&mut self, feedback: &TransportFeedback, now: Instant) -> Option<u32> {
-        if self.count == Some(feedback.count) {
+    /// Once per window, backs off for loss above 10 percent and otherwise grows
+    /// toward REMB, or by 8 percent without one, while loss stays under 2 percent.
+    pub fn update(&mut self, now: Instant) -> Option<u32> {
+        if now.saturating_duration_since(self.window) < WINDOW {
             return None;
         }
-        self.count = Some(feedback.count);
-        let reference = match self.reference {
-            // Sign-extend the 24-bit difference.
-            Some((raw, value)) => {
-                value + i64::from((feedback.reference.wrapping_sub(raw) << 8) as i32 >> 8)
-            }
-            None => i64::from(feedback.reference),
-        };
-        self.reference = Some((feedback.reference, reference));
-        if now.saturating_duration_since(self.floor_since) >= Duration::from_secs(5) {
-            self.floor = [self.floor[1], i64::MAX];
-            self.floor_since = now;
-        }
-        let (mut delay_sum, mut delay_count) = (0i128, 0u32);
-        let mut tracked = false;
-        for &(sequence, arrival) in &feedback.packets {
-            let Some(index) = self.index(sequence) else {
-                continue;
-            };
-            tracked = true;
-            let entry = &mut self.sent[index];
-            entry.reported = true;
-            if let Some(offset) = arrival {
-                let arrival = reference * 64_000 + offset;
-                entry.arrival = Some(arrival);
-                let delay = arrival - entry.at.duration_since(self.origin).as_micros() as i64;
-                self.floor[1] = self.floor[1].min(delay);
-                delay_sum += i128::from(delay);
-                delay_count += 1;
-            }
-        }
-        if !tracked {
+        self.window = now;
+        let (sent, lost) = (
+            std::mem::take(&mut self.sent),
+            std::mem::take(&mut self.lost),
+        );
+        // Too little traffic is no evidence either way.
+        if sent < 20 {
             return None;
         }
-        self.feedback = true;
-        // Queueing delay above the lowest recent one-way delay, which hides clock offset.
-        // Loss-only reports still drive congestion control without an arrival-delay sample.
-        if delay_count != 0 {
-            let floor = self.floor[0].min(self.floor[1]);
-            let queue = (delay_sum as f64 / f64::from(delay_count) - floor as f64) / 1000.0;
-            self.delay = self.delay * 0.6 + queue * 0.4;
+        let loss = f64::from(lost.min(sent)) / f64::from(sent);
+        if loss > 0.1 {
+            self.estimate *= 1.0 - 0.5 * loss;
+        } else if loss < 0.02 {
+            let receiver = self.receiver_bitrate(now).map_or(0.0, f64::from);
+            self.estimate = receiver.max(self.estimate * 1.08);
         }
-        let (lost, total) = self
-            .sent
-            .iter()
-            .filter(|e| e.reported && now.saturating_duration_since(e.at) < Duration::from_secs(1))
-            .fold((0, 0), |(lost, total), e| {
-                (lost + usize::from(e.arrival.is_none()), total + 1)
-            });
-        self.loss = if total >= 20 {
-            lost as f64 / total as f64
-        } else {
-            0.0
-        };
-        self.evaluate_probe(now);
-        let acked = self.acked();
-        let estimate = self.estimate;
-        if self.delay > OVERUSE_MS || self.loss > 0.1 {
-            if now.saturating_duration_since(self.decreased) >= Duration::from_millis(300) {
-                let delay_based = acked.unwrap_or(estimate).min(estimate) * 0.85;
-                let loss_based = estimate * (1.0 - 0.5 * self.loss);
-                self.estimate = if self.delay > OVERUSE_MS {
-                    delay_based.min(loss_based)
-                } else {
-                    loss_based
-                };
-                self.decreased = now;
-                self.next_probe = self.next_probe.max(now + Duration::from_secs(5));
-            }
-        } else if self.delay < NORMAL_MS && self.loss < 0.02 {
-            let elapsed = now
-                .saturating_duration_since(self.increased)
-                .min(Duration::from_secs(1));
-            let mut next = estimate * 1.08f64.powf(elapsed.as_secs_f64());
-            // An encoder well below its target is no evidence of more capacity.
-            if let Some(acked) = acked {
-                next = next.min((acked * 1.5 + 100_000.0).max(estimate));
-            }
-            self.estimate = next;
-        }
-        self.increased = now;
         self.apply(now)
     }
 
-    /// Received bitrate over the latest half second of arrivals.
-    fn acked(&self) -> Option<f64> {
-        let newest = self.sent.iter().filter_map(|e| e.arrival).max()?;
-        let (bytes, oldest) = self
-            .sent
-            .iter()
-            .filter_map(|e| {
-                e.arrival
-                    .filter(|a| *a >= newest - 500_000)
-                    .map(|a| (e.bytes, a))
-            })
-            .fold((0u64, newest), |(bytes, oldest), (b, a)| {
-                (bytes + u64::from(b), oldest.min(a))
-            });
-        let span = newest - oldest;
-        (span >= 100_000).then(|| bytes as f64 * 8e6 / span as f64)
-    }
-
-    /// Requests a probe cluster, returning the extra bitrate to add briefly.
-    pub fn probe(&mut self, now: Instant) -> Option<u32> {
-        let ceiling = f64::from(self.ceiling(now));
-        if !self.feedback
-            || self.probe.is_some()
-            || now < self.next_probe
-            || self.delay > NORMAL_MS
-            || self.loss >= 0.02
-            || self.estimate * 1.2 > ceiling
-        {
-            return None;
-        }
-        self.cluster = self.cluster.wrapping_add(1);
-        self.probe = Some(now);
-        self.next_probe = now + Duration::from_secs(1);
-        Some(((self.estimate * 2.0).min(ceiling) - self.estimate) as u32)
-    }
-
-    /// Adopts a probe's delivered rate, the minimum of its send and receive rates.
-    fn evaluate_probe(&mut self, now: Instant) {
-        let Some(started) = self.probe else {
-            return;
-        };
-        let cluster = Some(self.cluster);
-        let mut total = 0usize;
-        let mut all_reported = true;
-        let mut first_at: Option<Instant> = None;
-        let mut last_at: Option<Instant> = None;
-        let mut last_bytes = 0u32;
-        let mut send_bytes = 0.0f64;
-        let mut received_count = 0usize;
-        let mut earliest_arrival = i64::MAX;
-        let mut earliest_bytes = 0u32;
-        let mut latest_arrival = i64::MIN;
-        let mut receive_bytes = 0.0f64;
-        for entry in self.sent.iter().filter(|e| e.cluster == cluster) {
-            total += 1;
-            all_reported &= entry.reported;
-            if first_at.is_none() {
-                first_at = Some(entry.at);
-            }
-            last_at = Some(entry.at);
-            last_bytes = entry.bytes;
-            send_bytes += f64::from(entry.bytes);
-            if let Some(arrival) = entry.arrival {
-                received_count += 1;
-                if arrival < earliest_arrival {
-                    earliest_arrival = arrival;
-                    earliest_bytes = entry.bytes;
-                }
-                if arrival > latest_arrival {
-                    latest_arrival = arrival;
-                }
-                receive_bytes += f64::from(entry.bytes);
-            }
-        }
-        let finished = self.sent.back().is_some_and(|e| e.cluster != cluster) && all_reported;
-        if !finished && now.saturating_duration_since(started) < Duration::from_secs(1) {
-            return;
-        }
-        self.probe = None;
-        let result = (|| {
-            if received_count < 5 || received_count * 5 < total * 4 {
-                return None;
-            }
-            let send_span = last_at?.duration_since(first_at?).as_micros() as f64;
-            let send_bytes = send_bytes - f64::from(last_bytes);
-            let receive_span = (latest_arrival - earliest_arrival) as f64;
-            let receive_bytes = receive_bytes - f64::from(earliest_bytes);
-            if send_span < 1000.0 || receive_span < 1000.0 {
-                return None;
-            }
-            let send = send_bytes * 8e6 / send_span;
-            let receive = receive_bytes * 8e6 / receive_span;
-            Some(if receive < send * 0.9 {
-                receive * 0.95
-            } else {
-                send.min(receive)
-            })
-        })();
-        match result {
-            Some(rate) if rate > self.estimate * 1.1 => self.estimate = rate,
-            _ => self.next_probe = now + Duration::from_secs(10),
-        }
-    }
-
-    /// Forgets per-packet state, keeping the estimate.
+    /// Forgets loss counts, keeping the estimate.
     pub fn clear(&mut self) {
-        self.sent.clear();
-        self.probe = None;
+        self.sent = 0;
+        self.lost = 0;
     }
 }

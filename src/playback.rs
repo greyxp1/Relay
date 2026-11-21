@@ -27,14 +27,13 @@ pub struct Playback {
 impl Playback {
     pub fn new(device: &str) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
-        #[cfg(target_os = "linux")]
-        let sink = "pulsesink buffer-time=60000 latency-time=20000 stream-properties=props,node.name=relay-playback,application.name=Relay";
-        #[cfg(target_os = "windows")]
-        let sink = "wasapi2sink low-latency=true";
         // Give loss notifications and decoding one packet's processing time before mixing.
-        let pipeline = gst::parse::launch(&format!(
-            "audiomixer name=mix force-live=true ignore-inactive-pads=true min-upstream-latency=60000000 latency=20000000 ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! volume name=volume ! audioconvert ! audioresample ! {sink} name=output"
-        )).map_err(|e| e.to_string())?.downcast::<gst::Pipeline>().map_err(|_| "Invalid playback pipeline")?;
+        let pipeline = gst::parse::launch(
+            "audiomixer name=mix force-live=true ignore-inactive-pads=true min-upstream-latency=60000000 latency=20000000 ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! volume name=volume ! audioconvert ! audioresample ! pulsesink name=output buffer-time=60000 latency-time=20000 stream-properties=props,node.name=relay-playback,application.name=Relay",
+        )
+        .map_err(|e| e.to_string())?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "Invalid playback pipeline")?;
         let mixer = pipeline.by_name("mix").unwrap();
         let mut playback = Self {
             pipeline,
@@ -50,11 +49,9 @@ impl Playback {
     }
 
     pub fn set_device(&self, selected: &str) -> Result<(), String> {
-        let device = if selected.is_empty() {
-            None
-        } else {
-            Some(Capture::audio_device(selected, true)?)
-        };
+        let device = (!selected.is_empty())
+            .then(|| Capture::audio_device(selected, true))
+            .transpose()?;
         self.pipeline
             .set_state(gst::State::Null)
             .map_err(|e| e.to_string())?;
@@ -87,18 +84,23 @@ impl Playback {
         Ok(())
     }
 
+    fn user_volume(&self, user: u64) -> f64 {
+        self.volumes
+            .get(&user)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 10.0)
+    }
+
     pub fn set_volume(&mut self, volume: f64, users: &HashMap<u64, f64>) {
         self.pipeline
             .by_name("volume")
             .unwrap()
             .set_property("volume", volume.clamp(0.0, 10.0));
-        for (user, speaker) in &self.speakers {
-            speaker.pad.set_property(
-                "volume",
-                users.get(user).copied().unwrap_or(1.0).clamp(0.0, 10.0),
-            );
-        }
         self.volumes.clone_from(users);
+        for (user, speaker) in &self.speakers {
+            speaker.pad.set_property("volume", self.user_volume(*user));
+        }
     }
 
     fn remove_speaker(&self, speaker: Speaker) {
@@ -109,16 +111,16 @@ impl Playback {
     }
 
     pub fn push(&mut self, frame: ReceivedFrame) -> Result<(), String> {
+        let ReceivedFrame { user, ssrc, packet } = frame;
         if self
             .speakers
-            .get(&frame.user)
-            .is_some_and(|speaker| speaker.ssrc.is_some_and(|ssrc| ssrc != frame.ssrc))
+            .get(&user)
+            .is_some_and(|s| s.ssrc.is_some_and(|old| old != ssrc))
         {
-            if let Some(speaker) = self.speakers.remove(&frame.user) {
-                self.remove_speaker(speaker);
-            }
+            let speaker = self.speakers.remove(&user).unwrap();
+            self.remove_speaker(speaker);
         }
-        if !self.speakers.contains_key(&frame.user) {
+        if !self.speakers.contains_key(&user) {
             if self.speakers.len() >= 128 {
                 return Err("Too many audio participants".into());
             }
@@ -126,36 +128,19 @@ impl Playback {
                 Some(speaker) => speaker,
                 None => self.create_speaker()?,
             };
-            speaker.pad.set_property(
-                "volume",
-                self.volumes
-                    .get(&frame.user)
-                    .copied()
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 10.0),
-            );
-            self.speakers.insert(frame.user, speaker);
+            speaker.pad.set_property("volume", self.user_volume(user));
+            self.speakers.insert(user, speaker);
         }
-        let speaker = self.speakers.get_mut(&frame.user).unwrap();
-        speaker.ssrc = Some(frame.ssrc);
+        let speaker = self.speakers.get_mut(&user).unwrap();
+        speaker.ssrc = Some(ssrc);
         speaker.seen = Instant::now();
-        if frame.data.len() > 24 {
+        // Opus DTX comfort-noise frames are a few bytes. Anything larger carries voice.
+        if packet.len() > 12 + 24 {
             speaker.voiced = Some(speaker.seen);
-        }
-        let mut buffer =
-            gst::Buffer::with_size(12 + frame.data.len()).map_err(|e| e.to_string())?;
-        {
-            let mut map = buffer.get_mut().unwrap().map_writable().map_err(|e| e.to_string())?;
-            map[0] = 0x80;
-            map[1] = 120 | (u8::from(frame.marker) << 7);
-            map[2..4].copy_from_slice(&frame.sequence.to_be_bytes());
-            map[4..8].copy_from_slice(&frame.timestamp.to_be_bytes());
-            map[8..12].copy_from_slice(&frame.ssrc.to_be_bytes());
-            map[12..].copy_from_slice(&frame.data);
         }
         speaker
             .input
-            .push_buffer(buffer)
+            .push_buffer(gst::Buffer::from_mut_slice(packet))
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -163,8 +148,10 @@ impl Playback {
     fn create_speaker(&self) -> Result<Speaker, String> {
         // Keep queued loss notifications so the Opus decoder can conceal missing packets.
         let bin = gst::parse::bin_from_description(
-            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=60 do-lost=true max-dropout-time=1000 max-misorder-time=500 ! rtpopusdepay ! opusdec plc=true use-inband-fec=true ! audioconvert ! capsfilter caps=\"audio/x-raw,format=F32LE,rate=48000,channels=2\"", true
-        ).map_err(|e| e.to_string())?;
+            "appsrc name=input is-live=true do-timestamp=true format=time max-buffers=32 leaky-type=downstream caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=120 ! rtpjitterbuffer latency=60 do-lost=true max-dropout-time=1000 max-misorder-time=500 ! rtpopusdepay ! opusdec plc=true use-inband-fec=true ! audioconvert ! capsfilter caps=\"audio/x-raw,format=F32LE,rate=48000,channels=2\"",
+            true,
+        )
+        .map_err(|e| e.to_string())?;
         let input = bin.by_name("input").unwrap().downcast::<AppSrc>().unwrap();
         self.pipeline.add(&bin).map_err(|e| e.to_string())?;
         bin.link(&self.mixer).map_err(|e| e.to_string())?;
@@ -182,24 +169,25 @@ impl Playback {
     }
 
     pub fn speakers(&mut self) -> Vec<u64> {
-        let mut active = Vec::new();
-        let mut expired = Vec::new();
-        for (&user, speaker) in &self.speakers {
-            if speaker.seen.elapsed() > Duration::from_secs(30) {
-                expired.push(user);
-            } else if speaker
-                .voiced
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
-            {
-                active.push(user);
-            }
-        }
+        let expired: Vec<_> = self
+            .speakers
+            .iter()
+            .filter(|(_, s)| s.seen.elapsed() > Duration::from_secs(30))
+            .map(|(user, _)| *user)
+            .collect();
         for user in expired {
-            if let Some(speaker) = self.speakers.remove(&user) {
-                self.remove_speaker(speaker);
-            }
+            let speaker = self.speakers.remove(&user).unwrap();
+            self.remove_speaker(speaker);
         }
-        active
+        let voiced = |s: &Speaker| {
+            s.voiced
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
+        };
+        self.speakers
+            .iter()
+            .filter(|(_, s)| voiced(s))
+            .map(|(user, _)| *user)
+            .collect()
     }
 
     pub fn error(&self) -> Option<String> {
@@ -210,12 +198,11 @@ impl Playback {
         {
             match message.view() {
                 gst::MessageView::Error(error) => return Some(error.error().to_string()),
-                gst::MessageView::Latency(_) => {
+                _ => {
                     if let Err(error) = self.pipeline.recalculate_latency() {
                         return Some(error.to_string());
                     }
                 }
-                _ => (),
             }
         }
         None
@@ -230,12 +217,9 @@ impl Drop for Playback {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn speaker_bin_parses() {
-        gst::init().unwrap();
-        let playback = Playback::new("").unwrap();
+        let playback = super::Playback::new("").unwrap();
         let speaker = playback.create_speaker().unwrap();
         playback.remove_speaker(speaker);
     }
