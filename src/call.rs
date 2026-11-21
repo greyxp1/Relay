@@ -58,10 +58,6 @@ fn microphone(
         })
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 enum Command {
@@ -98,8 +94,6 @@ enum Command {
         #[serde(flatten)]
         quality: ScreenSettings,
         audio: bool,
-        #[serde(default = "default_true")]
-        preview: bool,
         replace: Option<String>,
     },
     CancelShare,
@@ -129,7 +123,6 @@ struct Prepared {
     codecs: Vec<Codec>,
     expires: Instant,
     audio: bool,
-    preview: bool,
 }
 
 enum CaptureChange {
@@ -138,7 +131,6 @@ enum CaptureChange {
         source: String,
         quality: ScreenSettings,
         audio: bool,
-        preview: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Reconnect {
@@ -150,7 +142,6 @@ enum CaptureChange {
 async fn prepare(
     quality: ScreenSettings,
     audio: bool,
-    preview: bool,
     source: Option<String>,
 ) -> Result<Prepared, String> {
     let quality = quality.validate()?;
@@ -178,7 +169,6 @@ async fn prepare(
         codecs,
         expires: Instant::now() + Duration::from_secs(60),
         audio,
-        preview,
     })
 }
 
@@ -297,7 +287,7 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                             Command::Keyframe { id } => {
                                 if let Some(call) = calls.get(&id) { call.keyframe.send_replace(()); }
                             }
-                            Command::PrepareShare { id, source, quality, audio, preview, replace } => {
+                            Command::PrepareShare { id, source, quality, audio, replace } => {
                                 if let Some((_, _, task)) = picker.take() { task.abort(); }
                                 prepared = None;
                                 let same_camera = source.as_ref().filter(|source| !Capture::is_screen_source(source)).and_then(|source| replace.as_ref()
@@ -308,12 +298,12 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                                     tokio::task::spawn_local(async move {
                                         let quality = quality.validate()?;
                                         let (reply, response) = oneshot::channel();
-                                        camera.send(CaptureChange::Camera { source: source.unwrap(), quality, audio, preview, reply }).await
+                                        camera.send(CaptureChange::Camera { source: source.unwrap(), quality, audio, reply }).await
                                             .map_err(|_| "Stream controls unavailable")?;
                                         response.await.map_err(|_| "Video device change stopped")?.map(|()| None)
                                     })
                                 } else {
-                                    tokio::task::spawn_local(async move { prepare(quality, audio, preview, source).await.map(Some) })
+                                    tokio::task::spawn_local(async move { prepare(quality, audio, source).await.map(Some) })
                                 };
                                 picker = Some((id, replace, task));
                             }
@@ -364,11 +354,9 @@ pub async fn serve(socket: WebSocket) -> Result<(), String> {
                 }
                 frame = preview(&mut prepared) => {
                     if let Some(frame) = frame {
-                        if prepared.as_ref().is_some_and(|p| p.preview) {
-                            if let Some((user, _, _)) = &identity {
-                                let user = user.parse().map_err(|_| "Invalid user")?;
-                                let _ = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame)));
-                            }
+                        if let Some((user, _, _)) = &identity {
+                            let user = user.parse().map_err(|_| "Invalid user")?;
+                            let _ = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame)));
                         }
                     } else { prepared = None; }
                 }
@@ -447,12 +435,11 @@ async fn run(
                 source,
                 quality,
                 audio,
-                preview,
                 reply,
             } => {
                 // Cameras can be exclusive. The old session must release its device before reopening it.
                 drop(prepared.take());
-                match prepare(quality, audio, preview, Some(source)).await {
+                match prepare(quality, audio, Some(source)).await {
                     Ok(prepared) => {
                         let _ = reply.send(Ok(()));
                         prepared
@@ -543,7 +530,6 @@ async fn run_session(
         }
     };
     let streaming = matches!(&mode, Mode::GoLive { .. });
-    let show_preview = prepared.as_ref().is_some_and(|p| p.preview);
     let transport = transport::run(credentials, mode, report);
     tokio::pin!(transport);
     let started = Instant::now();
@@ -623,7 +609,7 @@ async fn run_session(
             frame = capture_frames.recv(), if !streaming || pending_frame.is_none() => {
                 let mut frame = frame.ok_or("Capture ended")?;
                 if streaming {
-                    if show_preview && (!preview_waiting || frame.keyframe) {
+                    if !preview_waiting || frame.keyframe {
                         preview_waiting = output.try_reserve().map(|permit| permit.send(preview_frame(user, &frame))).is_err();
                         if preview_waiting { let _ = capture.request_keyframe(); }
                     }
