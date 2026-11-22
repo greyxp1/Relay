@@ -1,9 +1,9 @@
+use crate::share_audio::ShareAudio;
 pub use gst::ClockTime;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::{AppSink, AppSinkCallbacks};
 use std::{
     collections::VecDeque,
-    ffi::{c_char, c_void, CString},
     sync::{
         atomic::{AtomicU16, AtomicU64, Ordering},
         Arc, Mutex,
@@ -112,24 +112,6 @@ pub struct Frame {
     pub keyframe: bool,
 }
 
-unsafe extern "C" {
-    fn relay_share_audio_open(name: *const c_char, result: *mut *mut c_void) -> i32;
-    fn relay_share_audio_error(router: *mut c_void) -> i32;
-    fn relay_share_audio_free(router: *mut c_void);
-}
-
-/// Routes other applications' audio into a private sink, without call playback.
-struct ShareAudio(*mut c_void);
-
-// All graph access is protected by PipeWire's thread loop lock, including destruction.
-unsafe impl Send for ShareAudio {}
-
-impl Drop for ShareAudio {
-    fn drop(&mut self) {
-        unsafe { relay_share_audio_free(self.0) }
-    }
-}
-
 struct Portal {
     session: Option<ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>>,
     _remote: Option<std::os::fd::OwnedFd>,
@@ -157,7 +139,7 @@ pub struct Capture {
     /// Source and settings that rebuild video in another codec.
     video: Option<(String, VideoSettings)>,
     _portal: Option<Portal>,
-    audio: Option<ShareAudio>,
+    audio: Option<Box<ShareAudio>>,
 }
 
 fn launch(description: &str) -> Result<gst::Pipeline, String> {
@@ -309,16 +291,9 @@ impl Capture {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let target = CString::new(name.clone()).map_err(|e| e.to_string())?;
+        let target = name.clone();
         let router = tokio::task::spawn_blocking(move || {
-            let mut router = std::ptr::null_mut();
-            match unsafe { relay_share_audio_open(target.as_ptr(), &mut router) } {
-                result if result < 0 => Err(format!(
-                    "Could not isolate share audio: {}",
-                    std::io::Error::from_raw_os_error(-result)
-                )),
-                _ => Ok(ShareAudio(router)),
-            }
+            ShareAudio::open(target).map_err(|error| format!("Could not isolate share audio: {error}"))
         })
         .await
         .map_err(|_| "Audio isolation stopped")??;
@@ -327,7 +302,7 @@ impl Capture {
             Codec::Opus,
             None,
         )?;
-        capture.audio = Some(router);
+        capture.audio = Some(Box::new(router));
         Ok((capture, frames))
     }
 
@@ -587,11 +562,8 @@ impl Capture {
     }
 
     pub fn error(&self) -> Option<String> {
-        if let Some(audio) = &self.audio {
-            let error = unsafe { relay_share_audio_error(audio.0) };
-            if error != 0 {
-                return Some(std::io::Error::from_raw_os_error(error).to_string());
-            }
+        if let Some(error) = self.audio.as_deref().and_then(ShareAudio::error) {
+            return Some(error.to_string());
         }
         let message = self
             .pipeline

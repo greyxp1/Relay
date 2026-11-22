@@ -50,7 +50,7 @@
         fileset = pkgs.lib.fileset.unions [./Cargo.toml ./Cargo.lock ./build.rs ./src];
       };
       cargoLock.lockFile = ./Cargo.lock;
-      nativeBuildInputs = [pkgs.pkg-config pkgs.makeWrapper];
+      nativeBuildInputs = [pkgs.pkg-config pkgs.makeWrapper pkgs.rustPlatform.bindgenHook];
       buildInputs = runtimeLibraries;
       env = mediaEnv;
       doCheck = false;
@@ -80,6 +80,7 @@
     packages.${system} = {default = companion; inherit companion plugin;};
     devShells.${system}.default = pkgs.mkShell (mediaEnv // {
       packages = [pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.pkg-config pkgs.nodejs pkgs.typescript];
+      nativeBuildInputs = [pkgs.rustPlatform.bindgenHook];
       buildInputs = runtimeLibraries;
     });
     nixosModules.default = {config, lib, ...}: let

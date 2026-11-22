@@ -1,6 +1,11 @@
 //! H.264 Annex B parsing, RFC 6184 packetization and SPS normalization.
 use super::pacer::Payloads;
-use std::borrow::Cow;
+use std::{borrow::Cow, mem::MaybeUninit};
+
+#[allow(dead_code, non_camel_case_types, non_snake_case)]
+mod parser {
+    include!(concat!(env!("OUT_DIR"), "/h264.rs"));
+}
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -70,7 +75,8 @@ pub(super) fn normalize(frame: &[u8]) -> Result<Cow<'_, [u8]>> {
             if let Some(sps) = rewrite_sps(&frame[start..end])? {
                 let out = output.get_or_insert_with(|| Vec::with_capacity(frame.len() + 16));
                 out.extend_from_slice(&frame[copied..start]);
-                out.extend(sps);
+                // Preserve the original Annex B prefix instead of the writer's four-byte prefix.
+                out.extend_from_slice(&sps[4..]);
                 copied = end;
             }
         }
@@ -84,39 +90,87 @@ pub(super) fn normalize(frame: &[u8]) -> Result<Cow<'_, [u8]>> {
     })
 }
 
-unsafe extern "C" {
-    fn relay_normalize_sps(
-        input: *const u8,
-        size: u32,
-        output: *mut u8,
-        output_size: *mut u32,
-    ) -> i32;
-}
-
 fn rewrite_sps(nal: &[u8]) -> Result<Option<Vec<u8>>> {
+    use parser::*;
+
     const INVALID: &str = "Invalid or unsupported baseline H.264 SPS";
-    if nal.len() > 4097 {
+    if !(4..=4097).contains(&nal.len()) || nal[0] & 0x9f != 7 || nal[1] != 66 {
         return Err(INVALID.into());
     }
-    let mut output = Vec::<u8>::with_capacity(8192);
+    // SAFETY: the parser reads the bounded NAL and initializes the SPS on success.
+    let mut sps = unsafe {
+        let mut unit: GstH264NalUnit = std::mem::zeroed();
+        unit.data = nal.as_ptr().cast_mut();
+        unit.size = nal.len() as u32;
+        unit.header_bytes = 1;
+        let mut sps = MaybeUninit::<GstH264SPS>::uninit();
+        if gst_h264_parse_sps(&mut unit, sps.as_mut_ptr()) != GST_H264_PARSER_OK {
+            return Err(INVALID.into());
+        }
+        sps.assume_init()
+    };
+    let vui = &mut sps.vui_parameters;
+    if sps.num_ref_frames > 16
+        || sps.pic_width_in_mbs_minus1 > 65535
+        || sps.pic_height_in_map_units_minus1 > 65535
+        || sps.frame_crop_left_offset > 65535
+        || sps.frame_crop_right_offset > 65535
+        || sps.frame_crop_top_offset > 65535
+        || sps.frame_crop_bottom_offset > 65535
+        || vui.max_bytes_per_pic_denom > 16
+        || vui.num_reorder_frames > 16
+        || vui.max_dec_frame_buffering > 16
+    {
+        return Err(INVALID.into());
+    }
+    if sps.vui_parameters_present_flag != 0
+        && vui.bitstream_restriction_flag != 0
+        && vui.num_reorder_frames == 0
+        && vui.max_dec_frame_buffering <= sps.num_ref_frames
+    {
+        return Ok(None);
+    }
+    sps.vui_parameters_present_flag = 1;
+    vui.bitstream_restriction_flag = 1;
+    vui.motion_vectors_over_pic_boundaries_flag = 1;
+    vui.max_bytes_per_pic_denom = 2;
+    vui.max_bits_per_mb_denom = 1;
+    vui.log2_max_mv_length_horizontal = 16;
+    vui.log2_max_mv_length_vertical = 16;
+    vui.num_reorder_frames = 0;
+    vui.max_dec_frame_buffering = sps.num_ref_frames;
+
+    // GStreamer 1.22 writes into the existing bits without clearing the buffer.
+    let mut raw = [0u8; 8192];
+    let mut raw_size = raw.len() as u32;
+    let mut output = Vec::<u8>::with_capacity(raw.len());
     let mut size = output.capacity() as u32;
-    // SAFETY: both buffers are bounded and the native writer reports its initialized length.
-    let result = unsafe {
-        relay_normalize_sps(
-            nal.as_ptr(),
-            nal.len() as u32,
+    // SAFETY: both writers get bounded buffers and report the lengths they initialized.
+    unsafe {
+        if gst_h264_bit_writer_sps(&sps, 0, raw.as_mut_ptr(), &mut raw_size)
+            != GST_H264_BIT_WRITER_OK
+            || !(3..=raw.len() as u32).contains(&raw_size)
+        {
+            return Err(INVALID.into());
+        }
+        raw[0] = nal[0];
+        // Keep the constraint bits GStreamer's writer clears.
+        raw[2] |= nal[2] & 3;
+        if gst_h264_bit_writer_convert_to_nal(
+            4,
+            0,
+            0,
+            0,
+            raw.as_ptr(),
+            raw_size as gsize * 8,
             output.as_mut_ptr(),
             &mut size,
-        )
-    };
-    match result {
-        0 => Ok(None),
-        1 if (5..=output.capacity()).contains(&(size as usize)) => {
-            // SAFETY: successful native conversion initialized the returned Annex B NAL.
-            unsafe { output.set_len(size as usize) };
-            output.drain(..4);
-            Ok(Some(output))
+        ) != GST_H264_BIT_WRITER_OK
+            || !(5..=output.capacity()).contains(&(size as usize))
+        {
+            return Err(INVALID.into());
         }
-        _ => Err(INVALID.into()),
+        output.set_len(size as usize);
     }
+    Ok(Some(output))
 }

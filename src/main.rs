@@ -2,6 +2,7 @@ mod call;
 mod capture;
 mod dave;
 mod playback;
+mod share_audio;
 mod transport;
 
 use std::{net::Ipv4Addr, sync::Arc};

@@ -1,22 +1,30 @@
+use std::path::PathBuf;
+
 fn main() {
-    // Native libraries follow the static archives that use them for --as-needed linking.
-    for (source, library, version) in [
-        ("src/share_audio.c", "libpipewire-0.3", "0.3"),
-        ("src/h264.c", "gstreamer-codecparsers-1.0", "1.22"),
-    ] {
-        println!("cargo:rerun-if-changed={source}");
-        let native = pkg_config::Config::new()
-            .cargo_metadata(false)
-            .atleast_version(version)
-            .probe(library)
-            .unwrap_or_else(|_| panic!("{library} >= {version} development files are required"));
-        cc::Build::new()
-            .opt_level(2)
-            .includes(native.include_paths)
-            .file(source)
-            .compile(library);
-        pkg_config::probe_library(library).unwrap();
-    }
+    let parsers = pkg_config::Config::new()
+        .atleast_version("1.22")
+        .probe("gstreamer-codecparsers-1.0")
+        .expect("GStreamer codec parser development files >= 1.22 are required");
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("h264.rs");
+    bindgen::Builder::default()
+        .header_contents(
+            "h264.h",
+            "#define GST_USE_UNSTABLE_API\n#include <gst/codecparsers/gsth264bitwriter.h>",
+        )
+        .allowlist_function("gst_h264_(parse_sps|bit_writer_sps|bit_writer_convert_to_nal)")
+        .prepend_enum_name(false)
+        .clang_args(
+            parsers
+                .include_paths
+                .iter()
+                .map(|path| format!("-I{}", path.display())),
+        )
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("Could not generate GStreamer H.264 bindings")
+        .write_to_file(output)
+        .unwrap();
+
     println!("cargo:rerun-if-changed=src/dave_identity.cpp");
     println!("cargo:rerun-if-env-changed=RELAY_DAVE_DIR");
     let mut dave = cc::Build::new();
