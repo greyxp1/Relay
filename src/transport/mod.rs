@@ -246,7 +246,7 @@ struct Call<'a> {
     ws: Socket,
     // Signaling and MLS.
     users: BTreeSet<String>,
-    ssrc_users: BTreeMap<u32, String>,
+    ssrc_users: BTreeMap<u32, u64>,
     mls: Option<Mls>,
     external: Option<Vec<u8>>,
     group: u64,
@@ -318,11 +318,7 @@ impl<'a> Call<'a> {
         if !(1..=4096).contains(&c.session_id.len()) || !(1..=4096).contains(&c.token.len()) {
             return Err("Invalid voice credentials".into());
         }
-        let library = dave::DaveLibrary::load().map_err(|_| "DAVE library unavailable")?;
-        let max_version = library.max_supported_protocol_version();
-        if max_version == 0 {
-            return Err("Encrypted DAVE unavailable".into());
-        }
+        let max_version = davey::DAVE_PROTOCOL_VERSION;
         let config = WebSocketConfig::default()
             .max_message_size(Some(1024 * 1024))
             .max_frame_size(Some(1024 * 1024));
@@ -689,10 +685,7 @@ impl<'a> Call<'a> {
         };
         // Encrypt the whole frame before adding any RTP descriptors.
         let mls = self.mls.as_mut().ok_or("DAVE missing")?;
-        let data = mls
-            .encryptor
-            .encrypt(ssrc, frame.codec, &plain)
-            .map_err(|_| "DAVE frame encryption failed")?;
+        let data = mls.encrypt(frame.codec, &plain)?;
         if video {
             let limit = pacer::MAX_PAYLOAD;
             let payloads = match frame.codec {
@@ -763,24 +756,17 @@ impl<'a> Call<'a> {
             return Ok(());
         };
         let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-        let Some(user) = self.ssrc_users.get(&ssrc) else {
-            return Ok(());
-        };
-        let Some(decryptor) = self.mls.as_mut().and_then(|m| m.decryptors.get_mut(user)) else {
+        let (Some(&user), Some(mls)) = (self.ssrc_users.get(&ssrc), self.mls.as_mut()) else {
             return Ok(());
         };
         // Playback receives a plain RTP header without extensions or padding.
         let mut rtp_header: [u8; 12] = header[..12].try_into().unwrap();
         rtp_header[0] = 0x80;
-        let Ok(packet) = decryptor.decrypt(Codec::Opus, payload, &rtp_header) else {
+        let Some(packet) = mls.decrypt_voice(user, payload, rtp_header) else {
             return Ok(());
         };
         // Playback is polled alongside transport and can drain a full queue once this send yields.
-        let frame = ReceivedFrame {
-            user: user.parse().unwrap_or_default(),
-            ssrc,
-            packet,
-        };
+        let frame = ReceivedFrame { user, ssrc, packet };
         output
             .send(frame)
             .await
@@ -963,6 +949,7 @@ impl<'a> Call<'a> {
                     return Err("Local voice user disconnected".into());
                 }
                 self.users.remove(&user);
+                let user = user.parse::<u64>().map_err(|_| "Malformed voice user ID")?;
                 self.ssrc_users.retain(|_, u| *u != user);
             }
             15 => self.on_sink_wants(d)?,
@@ -972,6 +959,7 @@ impl<'a> Call<'a> {
                     return Err("Unrecognized speaking user".into());
                 }
                 let remote = int(d, "ssrc")?;
+                let user = user.parse::<u64>().map_err(|_| "Malformed voice user ID")?;
                 self.ssrc_users.retain(|_, u| *u != user);
                 if remote == self.ssrc || self.ssrc_users.contains_key(&remote) {
                     return Err("Conflicting voice SSRC".into());
@@ -981,7 +969,7 @@ impl<'a> Call<'a> {
             21 => {
                 let mls = self.mls.as_ref().ok_or("DAVE transition before session")?;
                 if version(d, "protocol_version", self.max_version)?
-                    != mls.session.protocol_version()
+                    != mls.session.protocol_version().get()
                 {
                     return Err("Unprepared DAVE version change".into());
                 }
@@ -1104,7 +1092,7 @@ impl<'a> Call<'a> {
         self.new_key_package(version).await
     }
 
-    /// A fresh session clears libdave's retained roster as well as the HPKE leaf.
+    /// A fresh session clears the roster and regenerates the HPKE leaf.
     /// The call's shared signing identity survives independently.
     async fn new_key_package(&mut self, version: u16) -> Result<(), String> {
         let generation = self
@@ -1120,7 +1108,7 @@ impl<'a> Call<'a> {
         mls.generation = generation;
         let package = mls
             .session
-            .key_package()
+            .create_key_package()
             .map_err(|_| "DAVE key package failed")?;
         self.mls = Some(mls);
         binary(&mut self.ws, 26, package).await
@@ -1128,12 +1116,11 @@ impl<'a> Call<'a> {
 
     async fn begin_transition(&mut self, transition: u16) -> Result<(), String> {
         let mls = self.mls.as_mut().ok_or("DAVE missing")?;
-        mls.pending = Some((transition, Instant::now()));
-        if transition == 0 {
-            mls.execute(0)
-        } else {
-            event(&mut self.ws, 23, json!({"transition_id":transition})).await
+        mls.prepare(transition)?;
+        if transition != 0 {
+            event(&mut self.ws, 23, json!({"transition_id":transition})).await?;
         }
+        Ok(())
     }
 
     async fn on_binary(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -1159,18 +1146,19 @@ impl<'a> Call<'a> {
     }
 
     async fn on_mls(&mut self, op: u8, data: &[u8]) -> Result<(), String> {
-        let recognized: Vec<_> = self.users.iter().map(String::as_str).collect();
+        let recognized = self
+            .users
+            .iter()
+            .map(|id| id.parse())
+            .collect::<Result<Vec<u64>, _>>()
+            .map_err(|_| "Malformed voice user ID")?;
         let mls = self.mls.as_mut().ok_or("MLS message before session")?;
         if !mls.external {
             return Err("MLS message before external sender".into());
         }
         if op == 27 {
             // MLS state advances on commit, independently of the pending media-key switch.
-            let commit = mls
-                .session
-                .process_proposals(data, &recognized)
-                .map_err(|_| "MLS proposals rejected")?;
-            if let Some(commit) = commit {
+            if let Some(commit) = mls.process_proposals(data, &recognized)? {
                 binary(&mut self.ws, 28, commit).await?;
             }
             return Ok(());
@@ -1179,31 +1167,31 @@ impl<'a> Call<'a> {
             return Err("Invalid MLS transition".into());
         }
         let transition = u16::from_be_bytes([data[0], data[1]]);
-        let result = if op == 29 {
-            match mls.session.process_commit(&data[2..]) {
-                Ok(None) => return Ok(()),
-                result => result.map(|roster| (roster.unwrap(), false)),
-            }
+        let accepted = if op == 29 {
+            mls.session.process_commit(&data[2..]).map_err(|_| ())
         } else {
             mls.session
-                .process_welcome(&data[2..], &recognized)
-                .map(|roster| (roster, true))
+                .process_welcome(&data[2..], Some(&recognized))
+                .map(|()| true)
+                .map_err(|_| ())
         };
-        let Ok((roster, full)) = result else {
+        if matches!(accepted, Ok(false)) {
+            return Ok(());
+        }
+        if accepted.is_err() {
             event(&mut self.ws, 31, json!({"transition_id":transition})).await?;
             if self.recoveries >= 3 {
                 return Err("MLS recovery budget exhausted".into());
             }
             self.recoveries += 1;
-            let version = mls.session.protocol_version();
+            let version = mls.session.protocol_version().get();
             self.new_key_package(version).await?;
             self.dave_ready = false;
             self.report();
             self.startup = Instant::now() + DEADLINE;
             return Ok(());
-        };
-        let receiving = matches!(self.mode, Mode::Voice { .. });
-        mls.roster(roster, full, &self.users, &self.user_id, receiving)?;
+        }
+        mls.update_roster(&recognized)?;
         self.begin_transition(transition).await
     }
 

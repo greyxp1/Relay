@@ -24,16 +24,4 @@ fn main() {
         .expect("Could not generate GStreamer H.264 bindings")
         .write_to_file(output)
         .unwrap();
-
-    println!("cargo:rerun-if-changed=src/dave_identity.cpp");
-    println!("cargo:rerun-if-env-changed=RELAY_DAVE_DIR");
-    let mut dave = cc::Build::new();
-    if let Some(directory) = std::env::var_os("RELAY_DAVE_DIR") {
-        dave.include(std::path::Path::new(&directory).join("include"));
-    }
-    dave.cpp(true)
-        .std("c++17")
-        .opt_level(2)
-        .file("src/dave_identity.cpp")
-        .compile("relay_dave_identity");
 }

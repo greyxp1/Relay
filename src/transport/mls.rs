@@ -1,14 +1,14 @@
 //! Per-connection DAVE state.
 use super::USERS;
-use crate::dave;
-use std::collections::{BTreeMap, BTreeSet};
+use crate::{capture::Codec, dave};
+use davey::{DaveSession, MediaType, ProposalsOperationType};
+use std::collections::BTreeMap;
 use tokio::time::Instant;
 
 pub(super) struct Mls {
-    pub session: dave::Session,
-    pub encryptor: dave::Encryptor,
-    pub decryptors: BTreeMap<String, dave::Decryptor>,
-    roster: BTreeSet<String>,
+    pub session: DaveSession,
+    scratch: Vec<u8>,
+    roster: BTreeMap<u64, Vec<u8>>,
     pub pending: Option<(u16, Instant)>,
     pub external: bool,
     pub ready: bool,
@@ -22,16 +22,10 @@ impl Mls {
         version: u16,
         external: Option<&[u8]>,
     ) -> Result<Self, String> {
-        let session = dave::Session::new(identity, group, version)
-            .map_err(|_| "DAVE initialization failed")?;
-        let encryptor = session
-            .encryptor()
-            .map_err(|_| "DAVE encryptor initialization failed")?;
         let mut mls = Self {
-            session,
-            encryptor,
-            decryptors: BTreeMap::new(),
-            roster: BTreeSet::new(),
+            session: identity.session(group, version)?,
+            scratch: Vec::new(),
+            roster: BTreeMap::new(),
             pending: None,
             external: false,
             ready: false,
@@ -51,67 +45,114 @@ impl Mls {
         Ok(())
     }
 
-    pub fn roster(
+    pub fn process_proposals(
         &mut self,
-        members: Vec<dave::RosterMember>,
-        full: bool,
-        recognized: &BTreeSet<String>,
-        own: &str,
-        receiving: bool,
-    ) -> Result<(), String> {
-        if full {
-            self.roster.clear();
-        }
-        if members.len() > USERS {
-            return Err("DAVE roster exceeded limit".into());
-        }
-        for (user, signed) in members {
-            let user = user.to_string();
-            if !full && !signed {
-                self.roster.remove(&user);
-            } else if recognized.contains(&user) {
-                self.roster.insert(user);
-            } else {
+        data: &[u8],
+        recognized: &[u64],
+    ) -> Result<Option<Vec<u8>>, String> {
+        let (operation, proposals) = data.split_first().ok_or("Empty MLS proposals")?;
+        let operation = match operation {
+            0 => ProposalsOperationType::APPEND,
+            1 => ProposalsOperationType::REVOKE,
+            _ => return Err("Invalid MLS proposals operation".into()),
+        };
+        let commit = self
+            .session
+            .process_proposals(operation, proposals, Some(recognized))
+            .map_err(|_| "MLS proposals rejected")?;
+        Ok(commit.map(|mut update| {
+            if let Some(welcome) = update.welcome {
+                update.commit.extend(welcome);
+            }
+            update.commit
+        }))
+    }
+
+    pub fn update_roster(&mut self, recognized: &[u64]) -> Result<(), String> {
+        let group = self.session.group().ok_or("DAVE roster missing")?;
+        let mut roster = BTreeMap::new();
+        for member in group.members() {
+            if roster.len() >= USERS {
+                return Err("DAVE roster exceeded limit".into());
+            }
+            let bytes: [u8; 8] = member
+                .credential
+                .serialized_content()
+                .try_into()
+                .map_err(|_| "Malformed DAVE member ID")?;
+            let id = u64::from_be_bytes(bytes);
+            if self.roster.get(&id) != Some(&member.signature_key) && !recognized.contains(&id) {
                 return Err("Unrecognized DAVE member".into());
             }
+            roster.insert(id, member.signature_key);
         }
-        if self.roster.len() > USERS {
-            return Err("DAVE roster exceeded limit".into());
+        self.roster = roster;
+        Ok(())
+    }
+
+    pub fn prepare(&mut self, transition: u16) -> Result<(), String> {
+        if !self.external || self.pending.is_some() {
+            return Err("Invalid DAVE prepare transition".into());
         }
-        if !receiving {
-            return Ok(());
-        }
-        self.decryptors.retain(|user, _| self.roster.contains(user));
-        for user in self.roster.iter().filter(|user| *user != own) {
-            if !self.decryptors.contains_key(user) {
-                let decryptor = self
-                    .session
-                    .decryptor(user)
-                    .map_err(|_| "DAVE receiver creation failed")?;
-                self.decryptors.insert(user.clone(), decryptor);
-            }
-            self.session
-                .transition_receiver(self.decryptors.get_mut(user).unwrap())
-                .map_err(|_| "DAVE receiver transition failed")?;
+        self.session
+            .prepare_transition(transition, self.session.protocol_version().get())
+            .map_err(|_| "DAVE receiver transition failed")?;
+        if transition == 0 {
+            self.finish_transition();
+        } else {
+            self.pending = Some((transition, Instant::now()));
         }
         Ok(())
     }
 
     pub fn execute(&mut self, transition: u16) -> Result<(), String> {
-        if !self.external || self.pending.map(|p| p.0) != Some(transition) {
+        if self.pending.map(|pending| pending.0) != Some(transition) {
+            return Err("Invalid DAVE execute transition".into());
+        }
+        if !self
+            .session
+            .execute_transition(transition)
+            .map_err(|_| "DAVE sender transition failed")?
+        {
             return Err("Invalid DAVE execute transition".into());
         }
         self.pending = None;
-        // An epoch reset can execute before a new group has any authenticated
-        // members. There is no sender ratchet until a commit or welcome arrives.
-        self.ready = false;
-        if !self.roster.is_empty() {
-            self.session
-                .transition_sender(&mut self.encryptor)
-                .map_err(|_| "DAVE sender transition failed")?;
-            self.generation = self.generation.wrapping_add(1);
-            self.ready = true;
-        }
+        self.finish_transition();
         Ok(())
+    }
+
+    fn finish_transition(&mut self) {
+        self.ready = self.session.can_encrypt();
+        if self.ready {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    pub fn encrypt(&mut self, codec: Codec, frame: &[u8]) -> Result<&[u8], String> {
+        if frame.is_empty() {
+            return Err("Empty DAVE frame".into());
+        }
+        let (media, codec) = dave::media_codec(codec);
+        self.session
+            .encrypt_into(media, codec, frame, &mut self.scratch)
+            .map_err(|_| "DAVE frame encryption failed")?;
+        Ok(&self.scratch)
+    }
+
+    pub fn decrypt_voice(&mut self, user: u64, frame: &[u8], header: [u8; 12]) -> Option<Vec<u8>> {
+        if frame.is_empty() {
+            return None;
+        }
+        let mut packet = vec![0; header.len() + frame.len()];
+        let len = self
+            .session
+            .decrypt_into(user, MediaType::AUDIO, frame, &mut packet[header.len()..])
+            .ok()?;
+        if len == 0 {
+            return None;
+        }
+        packet[..header.len()].copy_from_slice(&header);
+        packet.truncate(header.len() + len);
+        Some(packet)
     }
 }

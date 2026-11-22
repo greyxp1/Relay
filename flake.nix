@@ -5,26 +5,11 @@
   outputs = {nixpkgs, ...}: let
     system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};
-    libdave = pkgs.stdenv.mkDerivation {
-      pname = "libdave";
-      version = "1.2.2";
-      src = pkgs.fetchurl {
-        url = "https://github.com/discord/libdave/releases/download/v1.2.2/cpp/libdave-Linux-X64-boringssl.zip";
-        hash = "sha256-6WiLo6GwkI5eeqA39ACi9ZxpyYZ3qDqFftDyhJwzgxI=";
-      };
-      nativeBuildInputs = [ pkgs.unzip pkgs.autoPatchelfHook ];
-      buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-      sourceRoot = ".";
-      dontBuild = true;
-      installPhase = ''
-        runHook preInstall
-        mkdir -p $out
-        cp -r lib include $out/
-        mkdir -p $out/share/licenses/libdave
-        cp -r licenses/* $out/share/licenses/libdave/
-        runHook postInstall
-      '';
-      meta.platforms = [ system ];
+    davey = pkgs.fetchFromGitHub {
+      owner = "Snazzah";
+      repo = "davey";
+      rev = "ad44015e9c2beaa7f75b5bfa9ba2ab272776b372";
+      hash = "sha256-0k+MTSR/XFG2BseoOw0EyQGgcbQOdx9ULDGH4zc7XZs=";
     };
     # PipeWire 1.6.9 predates the merged keepalive fix in !3096.
     pipewire = pkgs.pipewire.overrideAttrs (old: {
@@ -33,12 +18,11 @@
         hash = "sha256-LvnhZD7lUJVQ5WSCWkIzzqRk5VWMdr2S/2AtCUgD+lI=";
       }) ./pipewire-keepalive.patch ];
     });
-    runtimeLibraries = with pkgs; [dbus gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-bad libdave pkgs.pipewire];
+    runtimeLibraries = with pkgs; [dbus gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-bad pkgs.pipewire];
     pluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (with pkgs.gst_all_1; [
       (pkgs.lib.getLib gstreamer) gst-plugins-base gst-plugins-good gst-plugins-ugly gst-plugins-bad pipewire
     ]);
     mediaEnv = {
-      CPLUS_INCLUDE_PATH = "${libdave}/include";
       GST_PLUGIN_SYSTEM_PATH_1_0 = pluginPath;
       LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibraries;
     };
@@ -49,14 +33,17 @@
         root = ./.;
         fileset = pkgs.lib.fileset.unions [./Cargo.toml ./Cargo.lock ./build.rs ./src];
       };
-      cargoLock.lockFile = ./Cargo.lock;
+      cargoLock = {
+        lockFile = ./Cargo.lock;
+        outputHashes."davey-0.2.0" = davey.outputHash;
+      };
       nativeBuildInputs = [pkgs.pkg-config pkgs.makeWrapper pkgs.rustPlatform.bindgenHook];
       buildInputs = runtimeLibraries;
       env = mediaEnv;
       doCheck = false;
       postInstall = ''
-        mkdir -p $out/share/licenses/relay
-        cp -r ${libdave}/share/licenses/libdave $out/share/licenses/relay/
+        install -Dm644 ${davey}/LICENSE "$out/share/licenses/relay/davey"
+        install -Dm644 "$cargoDeps"/aws-lc-sys-*/LICENSE "$out/share/licenses/relay/aws-lc-sys"
       '';
       postFixup = ''
         wrapProgram $out/bin/relay \
