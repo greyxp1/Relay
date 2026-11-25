@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 const AUDIO_BITRATE: u32 = 128_000;
 pub(crate) const VIDEO_MIN_BITRATE: u32 = 100_000;
 pub(crate) const VIDEO_START_BITRATE: u32 = 2_500_000;
+const NO_ENCODER: &str = "No NVENC or VA-API encoder supports this codec";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -35,29 +36,46 @@ impl Codec {
         }
     }
 
-    fn encoder(self) -> &'static str {
-        match self {
-            Self::H265 => "nvh265enc",
-            Self::Av1 => "nvav1enc",
-            _ => "nvh264enc",
-        }
+    /// NVENC, or else VA-API. Both register elements only for codecs the GPU supports.
+    /// VA-API low-power encoders lack CBR on Intel GPUs without HuC firmware.
+    fn encoder(self) -> Option<&'static str> {
+        let names = match self {
+            Self::H265 => ["nvh265enc", "vah265enc", "vah265lpenc"],
+            Self::Av1 => ["nvav1enc", "vaav1enc", "vaav1lpenc"],
+            _ => ["nvh264enc", "vah264enc", "vah264lpenc"],
+        };
+        names.into_iter().find(|&name| {
+            gst::ElementFactory::find(name).is_some() && (nvenc(name) || constant_bitrate(name))
+        })
     }
 
     /// Video codecs this machine encodes, most efficient first.
-    /// NVENC elements register only for codecs the GPU supports.
     pub fn available() -> Result<Vec<Self>, String> {
         gst::init().map_err(|e| e.to_string())?;
         let codecs = [Self::Av1, Self::H265, Self::H264];
         Ok(codecs
             .into_iter()
-            .filter(|c| gst::ElementFactory::find(c.encoder()).is_some())
+            .filter(|c| c.encoder().is_some())
             .collect())
     }
 }
 
-/// NVENC bitrate properties count kbit as 1024 bits.
-fn kbits(bitrate: u32) -> u32 {
-    bitrate / 1024
+fn nvenc(encoder: &str) -> bool {
+    encoder.starts_with("nv")
+}
+
+fn constant_bitrate(encoder: &str) -> bool {
+    gst::ElementFactory::make(encoder)
+        .build()
+        .ok()
+        .and_then(|element| element.find_property("rate-control"))
+        .and_then(|spec| spec.downcast::<gst::glib::ParamSpecEnum>().ok())
+        .is_some_and(|spec| spec.enum_class().value_by_nick("cbr").is_some())
+}
+
+/// NVENC bitrate properties count kbit as 1024 bits, and VA-API as 1000.
+fn kbits(encoder: &str, bitrate: u32) -> u32 {
+    bitrate / if nvenc(encoder) { 1024 } else { 1000 }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,7 +117,7 @@ impl VideoSettings {
             || !self.bitrate.is_multiple_of(1000)
             || self.codec == Codec::Opus
         {
-            return Err("NVENC video requires even dimensions from 192×128 to 3840×2160, 1–240 fps, and 100000–50000000 bit/s in steps of 1000".into());
+            return Err("Video requires even dimensions from 192×128 to 3840×2160, 1–240 fps, and 100000–50000000 bit/s in steps of 1000".into());
         }
         Ok(self)
     }
@@ -158,7 +176,7 @@ fn audio_pipeline(device: &str) -> Result<gst::Pipeline, String> {
     Ok(pipeline)
 }
 
-/// GStreamer video from `source`, scaled on the GPU and encoded by NVENC.
+/// GStreamer video from `source`, scaled on the GPU and encoded by NVENC or VA-API.
 fn video_pipeline(source: &str, settings: VideoSettings) -> Result<gst::Pipeline, String> {
     let VideoSettings {
         codec,
@@ -168,14 +186,38 @@ fn video_pipeline(source: &str, settings: VideoSettings) -> Result<gst::Pipeline
         bitrate,
     } = settings.validate()?;
     gst::init().map_err(|e| e.to_string())?;
-    let vbv = kbits(bitrate.min(VIDEO_START_BITRATE)) / 4;
-    // P4 gains about 0.4 dB over P1, but H.265 P4 tops out near 4K60 on one shared NVENC engine.
-    let quality_limit = if codec == Codec::H264 { 144 } else { 120 };
-    let pixels = u64::from(width) * u64::from(height) * u64::from(fps);
-    let preset = if pixels > 2560 * 1440 * quality_limit {
-        "p1"
+    let encoder = codec.encoder().ok_or(NO_ENCODER)?;
+    // Avoid periodic keyframes, whose bursts can overwhelm a limited send rate.
+    // Bound the rate buffer to the startup budget to keep keyframes small after bandwidth falls.
+    let vbv = kbits(encoder, bitrate.min(VIDEO_START_BITRATE)) / 4;
+    let bitrate = kbits(encoder, bitrate);
+    let encode = if nvenc(encoder) {
+        // P4 gains about 0.4 dB over P1, but H.265 P4 tops out near 4K60 on one shared NVENC engine.
+        let quality_limit = if codec == Codec::H264 { 144 } else { 120 };
+        let pixels = u64::from(width) * u64::from(height) * u64::from(fps);
+        let preset = if pixels > 2560 * 1440 * quality_limit {
+            "p1"
+        } else {
+            "p4"
+        };
+        let headers = if codec == Codec::Av1 {
+            ""
+        } else {
+            " repeat-sequence-header=true"
+        };
+        // Frames stay on the GPU from the DMA-BUF to NVENC. Rendering NV12 hands NVENC a PBO it can map.
+        // The default GL shader scales without locking later size queries into passthrough.
+        format!("glupload ! glcolorconvert ! glshader ! video/x-raw(memory:GLMemory),width={width},height={height},pixel-aspect-ratio=1/1 ! glcolorconvert ! video/x-raw(memory:GLMemory),format=NV12 ! {encoder} name=video_encoder preset={preset} tune=ultra-low-latency rc-mode=cbr bitrate={bitrate} vbv-buffer-size={vbv} spatial-aq=true gop-size=-1 bframes=0 rc-lookahead=0 zerolatency=true{headers}")
     } else {
-        "p4"
+        // VA-API imports only DMA-BUF formats its driver renders and uploads the rest.
+        // Its encoders repeat sequence headers on every keyframe, at most 1024 frames apart.
+        // One frame per golden frame group stops AV1 from reordering frames.
+        let group = if codec == Codec::Av1 {
+            " gf-group-size=1"
+        } else {
+            ""
+        };
+        format!("vapostproc scale-method=hq ! video/x-raw(memory:VAMemory),width={width},height={height},pixel-aspect-ratio=1/1,format=NV12 ! {encoder} name=video_encoder rate-control=cbr bitrate={bitrate} cpb-size={vbv} key-int-max=1024{group}")
     };
     let output = match codec {
         // Discord negotiates constrained-baseline H.264 for browser viewers.
@@ -185,19 +227,8 @@ fn video_pipeline(source: &str, settings: VideoSettings) -> Result<gst::Pipeline
         Codec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au,profile=main",
         _ => "video/x-av1,stream-format=obu-stream,alignment=tu",
     };
-    let headers = if codec == Codec::Av1 {
-        ""
-    } else {
-        " repeat-sequence-header=true"
-    };
-    // Avoid periodic keyframes, whose bursts can overwhelm a limited send rate.
-    // Bound the rate buffer to the startup budget to keep keyframes small after bandwidth falls.
-    // Frames stay on the GPU from the DMA-BUF to NVENC. Rendering NV12 hands NVENC a PBO it can map.
-    // The default GL shader scales without locking later size queries into passthrough.
     launch(&format!(
-        "{source} ! videorate drop-only=true skip-to-first=true ! capsfilter name=video_rate caps=\"video/x-raw(ANY),framerate={fps}/1\" ! glupload ! glcolorconvert ! glshader ! video/x-raw(memory:GLMemory),width={width},height={height},pixel-aspect-ratio=1/1 ! glcolorconvert ! video/x-raw(memory:GLMemory),format=NV12 ! {} name=video_encoder preset={preset} tune=ultra-low-latency rc-mode=cbr bitrate={} vbv-buffer-size={vbv} spatial-aq=true gop-size=-1 bframes=0 rc-lookahead=0 zerolatency=true{headers} ! {output} ! appsink name=encoded sync=false max-buffers=2",
-        codec.encoder(),
-        kbits(bitrate),
+        "{source} ! videorate drop-only=true skip-to-first=true ! capsfilter name=video_rate caps=\"video/x-raw(ANY),framerate={fps}/1\" ! {encode} ! {output} ! appsink name=encoded sync=false max-buffers=2"
     ))
 }
 
@@ -317,13 +348,13 @@ impl Capture {
         use std::os::fd::AsRawFd;
         let quality = quality.validate()?;
         gst::init().map_err(|e| e.to_string())?;
-        for name in [
-            "pipewiresrc",
-            codec.encoder(),
-            "glupload",
-            "glcolorconvert",
-            "glshader",
-        ] {
+        let encoder = codec.encoder().ok_or(NO_ENCODER)?;
+        let scaler: &[_] = if nvenc(encoder) {
+            &["glupload", "glcolorconvert", "glshader"]
+        } else {
+            &["vapostproc"]
+        };
+        for &name in ["pipewiresrc"].iter().chain(scaler) {
             gst::ElementFactory::find(name)
                 .ok_or_else(|| format!("Missing native media plugin: {name}"))?;
         }
@@ -588,7 +619,9 @@ impl Capture {
             .pipeline
             .by_name("video_encoder")
             .ok_or("Video encoder missing")?;
-        encoder.set_property("bitrate", kbits(bitrate));
+        let name = encoder.factory().ok_or("Video encoder missing")?.name();
+        // VA-API restarts its GOP to apply a bitrate, so the next frame is a keyframe.
+        encoder.set_property("bitrate", kbits(&name, bitrate));
         *settings = updated;
         Ok(())
     }
