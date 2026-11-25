@@ -457,6 +457,9 @@ async fn run_session(
             let capture = microphone(source.as_deref(), &output)?;
             capture.0.set_audio_volume(volume)?;
             let playback = Playback::new(&device).or_else(|error| {
+                if device.is_empty() {
+                    return Err(error);
+                }
                 device_error(
                     &output,
                     format!("{error}. Using the system default speaker."),

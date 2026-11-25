@@ -100,7 +100,15 @@ impl Playback {
         };
         // Load and link the first decoder before RTP starts arriving.
         playback.first = Some(playback.create_speaker()?);
-        playback.set_device(device)?;
+        let selected = (!device.is_empty())
+            .then(|| Capture::audio_device(device, true))
+            .transpose()?;
+        playback
+            .pipeline
+            .by_name("output")
+            .unwrap()
+            .set_property("device", selected.as_deref());
+        playback.start()?;
         Ok(playback)
     }
 

@@ -138,12 +138,13 @@ function control(message: any) {
         lastSpeakers = speakers;
     } else if (message.op === "ended") {
         const recoverable = !connection.rtc.isStreamSender() || !!message.recoverable;
+        const wasReady = connection.ready;
         connection.ended = true;
         if (connection.rtc.isStreamSender() && !recoverable) endCapture();
         connection.ready = false;
         connection.rtc.setState("RTC_DISCONNECTED");
         if (recoverable) connection.rtc._scheduleReconnect();
-        if (message.error && !recoverable) toast("Relay: " + message.error);
+        if (message.error && (!recoverable || !wasReady)) toast("Relay: " + message.error);
     } else if (message.op === "state") {
         const ready = !!message.ready;
         if (ready !== connection.ready) {
